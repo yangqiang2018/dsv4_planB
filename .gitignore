@@ -1,0 +1,10 @@
+ops-transformer/
+tilelang-ascend/
+.DS_Store
+.claude/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
