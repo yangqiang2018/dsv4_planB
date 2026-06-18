@@ -103,8 +103,7 @@ def build_sparse_attn_sharedkv(
     assert ori_block_size >= block_I // 2, "ori_block_size must be >= BI/2"
 
     gqa_group = n_heads // n_kv_heads  # 64 q-heads share 1 kv-head.
-    BI = block_I  # 128
-    BI_half = BI // 2  # 64 -- KV is loaded/gemm'd in two 64-row halves.
+    BI = block_I  # 128 -- the full sliding-window tile (one N=128 gemm).
     D = head_dim  # 512
     accum_dtype = "float"
     indices_dtype = "int32"
@@ -200,15 +199,14 @@ def build_sparse_attn_sharedkv(
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 (cube-side) buffers, double-buffered over pid parity. ----
+                # KV is one [128,512] tile (the full window) so Q@K^T / P@V are a
+                # single N=128 gemm each -- Ascend C tiles N=128, not 2x64.
                 q_l1 = T.alloc_L1([2, H_per_block, D], dtype)
-                kv_lo = T.alloc_L1([2, BI_half, D], dtype)
-                kv_hi = T.alloc_L1([2, BI_half, D], dtype)
-                p_lo = T.alloc_L1([H_per_block, BI_half], dtype)
-                p_hi = T.alloc_L1([H_per_block, BI_half], dtype)
-                # Two score accumulators so the two QK halves overlap with their
-                # L0C->GM fixpipe copies; one output accumulator for P@V.
-                acc_s_a = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
-                acc_s_b = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
+                kv = T.alloc_L1([2, BI, D], dtype)
+                p = T.alloc_L1([H_per_block, BI], dtype)
+                # acc_s ([64,128]) aliases the first 32KB of acc_o_l0c ([64,512]);
+                # the fix->m flag serializes their (sequential) reuse.
+                acc_s = T.alloc_L0C([H_per_block, BI], accum_dtype)
                 acc_o_l0c = T.alloc_L0C([H_per_block, D], accum_dtype)
 
                 # ---- UB (vector-side) buffers. ----
@@ -246,12 +244,9 @@ def build_sparse_attn_sharedkv(
                 T.annotate_address(
                     {
                         q_l1: 0,
-                        kv_lo: 128 * KB,
-                        kv_hi: 256 * KB,
-                        p_lo: 384 * KB,
-                        p_hi: 392 * KB,
-                        acc_s_a: 0,
-                        acc_s_b: 64 * KB,
+                        kv: 128 * KB,
+                        p: 384 * KB,
+                        acc_s: 0,
                         acc_o_l0c: l0c_addr["acc_o_l0c"],
                         acc_o_work: ub_addr["acc_o"],
                         acc_o_work2: ub_addr["acc_o"] + 32 * KB,
@@ -294,8 +289,9 @@ def build_sparse_attn_sharedkv(
 
                 # ============================ CUBE ============================
                 with T.Scope("C"):
+                    # Single fix->m token gates the shared L0C (acc_s aliases
+                    # acc_o_l0c); prime it once.
                     T.set_flag("fix", "m", 0)
-                    T.set_flag("fix", "m", 1)
                     for g in T.serial(total_work + 2):
                         # pid0 = current task (QK), pid1 = task-1 (PV).
                         pid0 = linear_start + g
@@ -347,128 +343,74 @@ def build_sparse_attn_sharedkv(
                         if valid0:
                             pa = g % 2
                             T.copy(Q[t0, 0:n_heads, 0:D], q_l1[pa, :, :])
-                            # --- Paged sliding-window KV gather into kv_lo/kv_hi. ---
-                            # Load BI=128 keys starting at ori_left0; ori_block_size
-                            # (128) >= BI_half so each 64-row half spans at most two
-                            # page segments (mirrors Ascend C DataCopyPA fast path).
-                            bidx_lo = ori_left0 // ori_block_size
-                            rowc_lo = ori_left0 % ori_block_size
-                            n_lo = ori_block_size - rowc_lo
-                            if n_lo >= BI_half:
+                            # --- Paged sliding-window KV gather into kv[0:128]. ---
+                            # 128 keys from ori_left0; ori_block_size (128) means the
+                            # tile spans at most two page segments (DataCopyPA path).
+                            bidx0 = ori_left0 // ori_block_size
+                            rowc0 = ori_left0 % ori_block_size
+                            n0 = ori_block_size - rowc0
+                            if n0 >= BI:
                                 T.copy(
                                     ori_KV[
-                                        ori_block_table[b0, bidx_lo],
-                                        rowc_lo : rowc_lo + BI_half,
+                                        ori_block_table[b0, bidx0],
+                                        rowc0 : rowc0 + BI,
                                         0,
                                         :,
                                     ],
-                                    kv_lo[pa, 0:BI_half, :],
+                                    kv[pa, 0:BI, :],
                                 )
                             else:
                                 T.copy(
                                     ori_KV[
-                                        ori_block_table[b0, bidx_lo],
-                                        rowc_lo : rowc_lo + n_lo,
+                                        ori_block_table[b0, bidx0],
+                                        rowc0 : rowc0 + n0,
                                         0,
                                         :,
                                     ],
-                                    kv_lo[pa, 0:n_lo, :],
+                                    kv[pa, 0:n0, :],
                                 )
                                 T.copy(
                                     ori_KV[
-                                        ori_block_table[b0, bidx_lo + 1],
-                                        0 : BI_half - n_lo,
+                                        ori_block_table[b0, bidx0 + 1],
+                                        0 : BI - n0,
                                         0,
                                         :,
                                     ],
-                                    kv_lo[pa, n_lo:BI_half, :],
-                                )
-                            g0_hi = ori_left0 + BI_half
-                            bidx_hi = g0_hi // ori_block_size
-                            rowc_hi = g0_hi % ori_block_size
-                            n_hi = ori_block_size - rowc_hi
-                            if n_hi >= BI_half:
-                                T.copy(
-                                    ori_KV[
-                                        ori_block_table[b0, bidx_hi],
-                                        rowc_hi : rowc_hi + BI_half,
-                                        0,
-                                        :,
-                                    ],
-                                    kv_hi[pa, 0:BI_half, :],
-                                )
-                            else:
-                                T.copy(
-                                    ori_KV[
-                                        ori_block_table[b0, bidx_hi],
-                                        rowc_hi : rowc_hi + n_hi,
-                                        0,
-                                        :,
-                                    ],
-                                    kv_hi[pa, 0:n_hi, :],
-                                )
-                                T.copy(
-                                    ori_KV[
-                                        ori_block_table[b0, bidx_hi + 1],
-                                        0 : BI_half - n_hi,
-                                        0,
-                                        :,
-                                    ],
-                                    kv_hi[pa, n_hi:BI_half, :],
+                                    kv[pa, n0:BI, :],
                                 )
                             T.set_flag("mte2", "m", 3)
                             T.wait_flag("mte2", "m", 3)
-                            # --- Q@K^T over the two 64-key halves. ---
+                            # --- Q@K^T over the full 128-key tile (single gemm). ---
                             T.wait_flag("fix", "m", 0)
                             T.gemm_v0(
                                 q_l1[pa, :, :],
-                                kv_lo[pa, :, :],
-                                acc_s_a,
+                                kv[pa, :, :],
+                                acc_s,
                                 transpose_B=True,
                                 init=True,
                             )
                             T.set_flag("m", "fix", 0)
-                            T.wait_flag("fix", "m", 1)
-                            T.gemm_v0(
-                                q_l1[pa, :, :],
-                                kv_hi[pa, :, :],
-                                acc_s_b,
-                                transpose_B=True,
-                                init=True,
-                            )
-                            T.set_flag("m", "fix", 2)
-                            # Drain L0C scores to the GM workspace (two halves).
                             T.wait_flag("m", "fix", 0)
-                            T.copy(acc_s_a, ws_score[cid, pa, 0:H_per_block, 0:BI_half])
+                            T.copy(acc_s, ws_score[cid, pa, 0:H_per_block, 0:BI])
                             T.set_flag("fix", "m", 0)
-                            T.wait_flag("m", "fix", 2)
-                            T.copy(
-                                acc_s_b, ws_score[cid, pa, 0:H_per_block, BI_half:BI]
-                            )
-                            T.set_flag("fix", "m", 1)
                             T.set_cross_flag("FIX", _FLAG_SCORE_READY)
 
                         if valid1:
                             pb = (g - 1) % 2
-                            # --- P@V: read P (softmax output) from the vector side. ---
+                            # --- P@V over the full 128-key tile (single gemm). ---
                             T.wait_cross_flag(_FLAG_P_READY)
-                            T.copy(ws_p[cid, pb, 0:H_per_block, 0:BI_half], p_lo)
-                            T.copy(ws_p[cid, pb, 0:H_per_block, BI_half:BI], p_hi)
+                            T.copy(ws_p[cid, pb, 0:H_per_block, 0:BI], p)
                             T.set_flag("mte2", "m", 0)
                             T.wait_flag("mte2", "m", 0)
                             T.wait_flag("fix", "m", 0)
-                            T.wait_flag("fix", "m", 1)
-                            T.gemm_v0(p_lo, kv_lo[pb, :, :], acc_o_l0c, init=True)
-                            T.gemm_v0(p_hi, kv_hi[pb, :, :], acc_o_l0c, init=False)
+                            T.gemm_v0(p, kv[pb, :, :], acc_o_l0c, init=True)
                             T.set_flag("m", "mte2", 0)
                             T.set_flag("m", "fix", 1)
                             T.wait_flag("m", "fix", 1)
                             T.copy(acc_o_l0c, ws_o[cid, pb, 0:H_per_block, 0:D])
                             T.set_flag("fix", "m", 0)
-                            T.set_flag("fix", "m", 1)
                             T.set_cross_flag("FIX", _FLAG_PV_READY)
                     T.wait_flag("fix", "m", 0)
-                    T.wait_flag("fix", "m", 1)
 
                 # =========================== VECTOR ===========================
                 with T.Scope("V"):
