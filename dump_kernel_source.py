@@ -40,7 +40,14 @@ sys.path.insert(
     ),
 )
 
-from kernel import build_sparse_attn_sharedkv, pass_configs  # noqa: E402
+from kernel import build_sparse_attn_sharedkv  # noqa: E402
+
+try:
+    from kernel import pass_configs  # noqa: E402
+except ImportError:
+    # The manual (non-auto-CV) kernel defines no module-level pass_configs;
+    # an empty config = default passes, which is correct for it.
+    pass_configs = {}
 
 # Build params per scenario, mirroring how api.py derives them from the
 # perf/test configs. Only shapes that affect the generated code structure matter.
