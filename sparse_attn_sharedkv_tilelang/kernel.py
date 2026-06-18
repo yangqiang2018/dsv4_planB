@@ -24,6 +24,7 @@ original so ``api.py`` is unchanged.
 
 import tilelang
 from tilelang import language as T
+from tvm import tir
 
 # ---------------------------------------------------------------------------
 # Compile-time defaults / layout constants.
@@ -123,6 +124,17 @@ def build_sparse_attn_sharedkv(
     assert v_block % MERGE_HEADS == 0
     N_MERGE_PASS = v_block // MERGE_HEADS
     assert N_MERGE_PASS == 2
+
+    def _b_idx(pid):
+        """Batch index for a work item, clamped into [0, batch).
+
+        Clamping (rather than ``if_then_else(in_range, pid//max_seq, 0)``) lets the
+        analyzer prove the per-batch ``actual_q_len``/``actual_kv_len``/``q_prefix``
+        GM reads are in-bounds, so NO bounds-guard is inserted -- which is what
+        lets those reads be cached into ``alloc_var`` scalars. Out-of-range lanes
+        get a valid (but unused, since ``valid*`` is false) index.
+        """
+        return tir.max(0, tir.min(pid // max_seq, batch - 1))
 
     # ---- Tensor shapes (the kernel ABI). ----
     q_shape = [total_tokens, n_heads, D]
@@ -308,7 +320,6 @@ def build_sparse_attn_sharedkv(
                     valid0 = T.alloc_var("bool", init=False)
                     valid1 = T.alloc_var("bool", init=False)
                     valid2 = T.alloc_var("bool", init=False)
-                    b0 = T.alloc_var(indices_dtype, init=0)
                     act_q0 = T.alloc_var(indices_dtype, init=0)
                     act_kv0 = T.alloc_var(indices_dtype, init=0)
                     s_global0 = T.alloc_var(indices_dtype, init=0)
@@ -332,7 +343,7 @@ def build_sparse_attn_sharedkv(
                             ),
                             False,
                         )
-                        b0 = T.if_then_else(in_range0, pid0 // max_seq, 0)
+                        b0 = _b_idx(pid0)
                         s0 = pid0 % max_seq
                         act_q0 = actual_q_len[b0]
                         act_kv0 = actual_kv_len[b0]
@@ -353,10 +364,7 @@ def build_sparse_attn_sharedkv(
                         )
                         valid1 = T.if_then_else(
                             in_range1,
-                            (pid1 % max_seq)
-                            < actual_q_len[
-                                T.if_then_else(in_range1, pid1 // max_seq, 0)
-                            ],
+                            (pid1 % max_seq) < actual_q_len[_b_idx(pid1)],
                             False,
                         )
 
@@ -370,10 +378,7 @@ def build_sparse_attn_sharedkv(
                         )
                         valid2 = T.if_then_else(
                             in_range2,
-                            (pid2 % max_seq)
-                            < actual_q_len[
-                                T.if_then_else(in_range2, pid2 // max_seq, 0)
-                            ],
+                            (pid2 % max_seq) < actual_q_len[_b_idx(pid2)],
                             False,
                         )
 
@@ -519,7 +524,6 @@ def build_sparse_attn_sharedkv(
                     valid0 = T.alloc_var("bool", init=False)
                     valid1 = T.alloc_var("bool", init=False)
                     valid2 = T.alloc_var("bool", init=False)
-                    b0 = T.alloc_var(indices_dtype, init=0)
                     act_q0 = T.alloc_var(indices_dtype, init=0)
                     act_kv0 = T.alloc_var(indices_dtype, init=0)
                     s_global0 = T.alloc_var(indices_dtype, init=0)
@@ -535,7 +539,7 @@ def build_sparse_attn_sharedkv(
                             ),
                             False,
                         )
-                        b0 = T.if_then_else(in_range0, pid0 // max_seq, 0)
+                        b0 = _b_idx(pid0)
                         s0 = pid0 % max_seq
                         act_q0 = actual_q_len[b0]
                         act_kv0 = actual_kv_len[b0]
@@ -554,7 +558,7 @@ def build_sparse_attn_sharedkv(
                             ),
                             False,
                         )
-                        b1 = T.if_then_else(in_range1, pid1 // max_seq, 0)
+                        b1 = _b_idx(pid1)
                         s1 = pid1 % max_seq
                         valid1 = T.if_then_else(in_range1, s1 < actual_q_len[b1], False)
                         s_global1 = actual_kv_len[b1] - actual_q_len[b1] + s1
@@ -567,7 +571,7 @@ def build_sparse_attn_sharedkv(
                             ),
                             False,
                         )
-                        b2 = T.if_then_else(in_range2, pid2 // max_seq, 0)
+                        b2 = _b_idx(pid2)
                         s2 = pid2 % max_seq
                         valid2 = T.if_then_else(in_range2, s2 < actual_q_len[b2], False)
                         t2 = q_prefix[b2] + s2
