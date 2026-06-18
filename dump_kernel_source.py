@@ -6,14 +6,20 @@ This confirms whether the TileLang port actually reproduces the Ascend C
 structure (matmul tiling, cube/vector split, sync pattern) -- the codegen runs at
 build time, so it only needs the CANN toolchain, not a device run.
 
+It uses ``tilelang.lower`` (codegen only, ``target.build.tilelang_ascend`` ->
+``CSourceModule``) so the source is produced even when the *device compile*
+(``bisheng`` in the JIT libgen step) would fail -- exactly the case we need when
+chasing a codegen bug like an ``int32_t``-in-expression parse error.
+
 Run on the NPU container::
 
     cd /sdb/yq/dsv4_planB
     python dump_kernel_source.py --scenario swa_prefill
-    # writes swa_prefill_generated.cce and prints a structural digest
+    # writes swa_prefill_generated.cce, prints a structural digest, and prints a
+    # window around any requested line / every int32_t occurrence
 
 Commit the ``*_generated.cce`` (``git add -f``) so it can be reviewed, or paste
-the printed digest.
+the printed digest / window.
 """
 
 from __future__ import annotations
@@ -23,6 +29,8 @@ import math
 import os
 import re
 import sys
+
+import tilelang
 
 sys.path.insert(
     0,
@@ -74,10 +82,27 @@ def _digest(src: str) -> str:
     return "\n".join(out)
 
 
+def _print_window(src: str, center: int, radius: int = 14) -> None:
+    """Print numbered lines [center-radius, center+radius] of ``src``."""
+    lines = src.splitlines()
+    lo = max(1, center - radius)
+    hi = min(len(lines), center + radius)
+    print(f"--- lines {lo}..{hi} (around {center}) ---")
+    for i in range(lo, hi + 1):
+        marker = ">>" if i == center else "  "
+        print(f"{marker}{i:5d}| {lines[i - 1]}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", default="swa_prefill", choices=list(CONFIGS))
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
+    ap.add_argument(
+        "--line",
+        type=int,
+        default=139,
+        help="center line to print a context window around (bisheng error line)",
+    )
     args = ap.parse_args()
 
     c = CONFIGS[args.scenario]
@@ -85,7 +110,7 @@ def main() -> None:
     ori_table_len = math.ceil(c["seqused_kv"] / ori_block_size)
     ori_block_num = ori_table_len + 1
 
-    func = build_sparse_attn_sharedkv(
+    prim_func = build_sparse_attn_sharedkv(
         batch=1,
         max_seq=c["max_seq"],
         total_tokens=c["total_tokens"],
@@ -105,14 +130,29 @@ def main() -> None:
         softmax_scale=0.04419417,
         dtype=args.dtype,
         core_num=24,
+        return_prim_func=True,
     )
-    src = func.get_kernel_source()
+
+    # Codegen only -- never invokes bisheng, so we get the generated Ascend C even
+    # when the device compile would reject it.
+    artifact = tilelang.lower(prim_func, target="ascendc")
+    src = artifact.kernel_source
+
     out_path = f"{args.scenario}_generated.cce"
     with open(out_path, "w") as f:
         f.write(src)
     print(f"wrote {out_path}")
     print("=" * 60)
     print(_digest(src))
+
+    # Targeted diagnostics for the int32_t-in-expression codegen bug.
+    print("=" * 60)
+    _print_window(src, args.line)
+    print("=" * 60)
+    print("int32_t occurrences (line: text):")
+    for i, ln in enumerate(src.splitlines(), 1):
+        if "int32_t" in ln:
+            print(f"  {i:5d}| {ln.strip()}")
 
 
 if __name__ == "__main__":

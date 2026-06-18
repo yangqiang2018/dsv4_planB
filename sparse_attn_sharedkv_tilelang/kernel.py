@@ -81,11 +81,16 @@ def build_sparse_attn_sharedkv(
     dtype: str = "bfloat16",
     block_I: int = DEFAULT_BLOCK_I,
     core_num: int = DEFAULT_CORE_NUM,
+    return_prim_func: bool = False,
 ):
     """JIT-compile the SparseAttnSharedkv kernel for one parameter set.
 
     Returns a ``tilelang.jit``-wrapped ``prim_func`` whose ABI is the 11 inputs
     / 2 outputs / 5 workspaces documented in ``api.py``.
+
+    When ``return_prim_func`` is True the *uncompiled* ``tir.PrimFunc`` is
+    returned instead (no bisheng), so codegen-only dumps can be obtained via
+    ``tilelang.lower`` even when the device compile would fail.
     """
     _check_dtypes(dtype)
     assert n_heads == 64, "API constraint: n_heads must be 64"
@@ -755,4 +760,9 @@ def build_sparse_attn_sharedkv(
 
         return sparse_attn_sharedkv_swa
 
+    if return_prim_func:
+        # ``@tilelang.jit`` keeps the original builder under ``__wrapped__``
+        # (set by functools.wraps); call it to materialize the raw PrimFunc
+        # without triggering the JIT compile / bisheng step.
+        return _make.__wrapped__()
     return _make()
