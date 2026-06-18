@@ -469,44 +469,7 @@ def build_sparse_attn_sharedkv(
                                     ],
                                     kv_hi[pa, n_hi:BI_half, :],
                                 )
-                            # PRELOAD: signal the gather is issued, but DO NOT wait
-                            # on it here. The PV(g-1) block below (its cross-core
-                            # P_READY wait + the two P@V gemms) runs while this
-                            # 192KB GM->L1 gather is in flight, hiding the load --
-                            # Ascend C's PreloadPipeline likewise keeps the cube
-                            # busy across the KV load instead of stalling on it. The
-                            # matching wait_flag + Q@K^T is a second valid0 block
-                            # AFTER PV(g-1). (kv_lo/kv_hi are double-buffered by
-                            # g%2, so gather(g) [slot g%2] and PV(g-1) [slot
-                            # (g-1)%2] never touch the same slot.)
                             T.set_flag("mte2", "m", 3)
-
-                        if valid1:
-                            pb = (g - 1) % 2
-                            # --- P@V: read P (softmax output) from the vector side. ---
-                            T.wait_cross_flag(_FLAG_P_READY)
-                            T.copy(ws_p[cid, pb, 0:H_per_block, 0:BI_half], p_lo)
-                            T.copy(ws_p[cid, pb, 0:H_per_block, BI_half:BI], p_hi)
-                            T.set_flag("mte2", "m", 0)
-                            T.wait_flag("mte2", "m", 0)
-                            T.wait_flag("fix", "m", 0)
-                            T.wait_flag("fix", "m", 1)
-                            T.gemm_v0(p_lo, kv_lo[pb, :, :], acc_o_l0c, init=True)
-                            T.gemm_v0(p_hi, kv_hi[pb, :, :], acc_o_l0c, init=False)
-                            T.set_flag("m", "mte2", 0)
-                            T.set_flag("m", "fix", 1)
-                            T.wait_flag("m", "fix", 1)
-                            T.copy(acc_o_l0c, ws_o[cid, pb, 0:H_per_block, 0:D])
-                            T.set_flag("fix", "m", 0)
-                            T.set_flag("fix", "m", 1)
-                            T.set_cross_flag("FIX", _FLAG_PV_READY)
-
-                        if valid0:
-                            # Q@K^T for query g. The gather was issued BEFORE the
-                            # PV(g-1) block above, so by now the 192KB GM->L1 load
-                            # has overlapped PV(g-1)'s gemm + P_READY wait and this
-                            # wait_flag rarely stalls (the preload payoff).
-                            pa = g % 2
                             T.wait_flag("mte2", "m", 3)
                             # --- Q@K^T over the two 64-key halves. ---
                             T.wait_flag("fix", "m", 0)
@@ -537,6 +500,26 @@ def build_sparse_attn_sharedkv(
                             )
                             T.set_flag("fix", "m", 1)
                             T.set_cross_flag("FIX", _FLAG_SCORE_READY)
+
+                        if valid1:
+                            pb = (g - 1) % 2
+                            # --- P@V: read P (softmax output) from the vector side. ---
+                            T.wait_cross_flag(_FLAG_P_READY)
+                            T.copy(ws_p[cid, pb, 0:H_per_block, 0:BI_half], p_lo)
+                            T.copy(ws_p[cid, pb, 0:H_per_block, BI_half:BI], p_hi)
+                            T.set_flag("mte2", "m", 0)
+                            T.wait_flag("mte2", "m", 0)
+                            T.wait_flag("fix", "m", 0)
+                            T.wait_flag("fix", "m", 1)
+                            T.gemm_v0(p_lo, kv_lo[pb, :, :], acc_o_l0c, init=True)
+                            T.gemm_v0(p_hi, kv_hi[pb, :, :], acc_o_l0c, init=False)
+                            T.set_flag("m", "mte2", 0)
+                            T.set_flag("m", "fix", 1)
+                            T.wait_flag("m", "fix", 1)
+                            T.copy(acc_o_l0c, ws_o[cid, pb, 0:H_per_block, 0:D])
+                            T.set_flag("fix", "m", 0)
+                            T.set_flag("fix", "m", 1)
+                            T.set_cross_flag("FIX", _FLAG_PV_READY)
                     T.wait_flag("fix", "m", 0)
                     T.wait_flag("fix", "m", 1)
 
