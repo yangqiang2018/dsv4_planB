@@ -303,7 +303,18 @@ def build_sparse_attn_sharedkv(
                     Metadata[meta_base + _FA_BN2_END_INDEX] * max_seq
                     + Metadata[meta_base + _FA_M_END_INDEX]
                 )
-                total_work = batch * max_seq
+                # Loop over THIS core's assigned tasks only -- Ascend C's ProcessBalance
+                # walks the core's [linear_start, linear_end) gloop, not the global
+                # index space. Bounding by total_work (= batch*max_seq) made every one
+                # of the 24 cores spin batch*max_seq iterations while doing real work on
+                # only ~1/core_num of them; the wasted iterations still re-ran the whole
+                # per-iteration validity/address scalar header + 3 metadata GM reads,
+                # which is what pinned aic_scalar_ratio=0.63 / aiv_scalar_ratio=0.29.
+                # +2 drains the 3-stage cross-query pipeline tail.
+                num_local = T.alloc_var(indices_dtype, init=0)
+                num_local = T.if_then_else(
+                    core_enable != 0, linear_end - linear_start, 0
+                )
 
                 # ============================ CUBE ============================
                 with T.Scope("C"):
@@ -327,7 +338,7 @@ def build_sparse_attn_sharedkv(
                     n_hi = T.alloc_var(indices_dtype, init=0)
                     T.set_flag("fix", "m", 0)
                     T.set_flag("fix", "m", 1)
-                    for g in T.serial(total_work + 2):
+                    for g in T.serial(num_local + 2):
                         # pid0 = current task (QK), pid1 = task-1 (PV).
                         pid0 = linear_start + g
                         in_range0 = T.if_then_else(
@@ -531,7 +542,7 @@ def build_sparse_attn_sharedkv(
                     ori_left0 = T.alloc_var(indices_dtype, init=0)
                     s_global1 = T.alloc_var(indices_dtype, init=0)
                     t2 = T.alloc_var(indices_dtype, init=0)
-                    for g in T.serial(total_work + 2):
+                    for g in T.serial(num_local + 2):
                         pid0 = linear_start + g
                         in_range0 = T.if_then_else(
                             core_enable != 0,
