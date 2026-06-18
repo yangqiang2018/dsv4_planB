@@ -235,6 +235,10 @@ def build_sparse_attn_sharedkv(
                 m_i_sv = T.alloc_ub([2, ub_len], accum_dtype)
                 sumexp_rt = T.alloc_ub([ub_len], accum_dtype)
                 m_i_rt = T.alloc_ub([ub_len], accum_dtype)
+                # Reciprocal of the running sum + its per-row broadcast, for the
+                # batched output divide (replaces the per-head div loop).
+                recip = T.alloc_ub([ub_len], accum_dtype)
+                recip_brd8 = T.alloc_ub([MERGE_HEADS, 8], accum_dtype)
 
                 T.annotate_address(
                     {
@@ -268,6 +272,8 @@ def build_sparse_attn_sharedkv(
                         m_i_sv: ub_addr["mask_sel"] + 32 + 256,
                         sumexp_rt: ub_addr["mask_sel"] + 32 + 512,
                         m_i_rt: ub_addr["mask_sel"] + 32 + 640,
+                        recip: ub_addr["mask_sel"] + 32 + 768,
+                        recip_brd8: ub_addr["mask_sel"] + 32 + 896,
                     }
                 )
 
@@ -494,6 +500,7 @@ def build_sparse_attn_sharedkv(
                         b1 = T.if_then_else(in_range1, pid1 // max_seq, 0)
                         s1 = pid1 % max_seq
                         valid1 = T.if_then_else(in_range1, s1 < actual_q_len[b1], False)
+                        s_global1 = actual_kv_len[b1] - actual_q_len[b1] + s1
 
                         pid2 = linear_start + g - 2
                         in_range2 = T.if_then_else(
@@ -509,18 +516,22 @@ def build_sparse_attn_sharedkv(
                         t2 = q_prefix[b2] + s2
 
                         if valid0:
-                            # Causal/window mask: key indices [ori_left, +128) must
-                            # be <= ori_right (= current global position).
-                            T.tile.createvecindex(idx_int, ori_left0)
-                            T.copy(idx_int, idx_float)
-                            T.barrier_all()
-                            T.tile.compare(
-                                mask_ub[g % 2, :],
-                                idx_float,
-                                T.float32(ori_right0),
-                                "LE",
-                            )
-                            T.barrier_all()
+                            # Build the causal/window mask ONLY for partial windows
+                            # (s_global < win_left): there the loaded 128 keys span
+                            # [0, 127] but only [0, s_global] are valid, so future
+                            # keys must be masked. A full window loads exactly its
+                            # valid keys, so masking is skipped (the common case).
+                            if s_global0 < ori_win_left:
+                                T.tile.createvecindex(idx_int, ori_left0)
+                                T.copy(idx_int, idx_float)
+                                T.barrier_all()
+                                T.tile.compare(
+                                    mask_ub[g % 2, :],
+                                    idx_float,
+                                    T.float32(ori_right0),
+                                    "LE",
+                                )
+                                T.barrier_all()
                             T.wait_cross_flag(_FLAG_SCORE_READY)
                             T.wait_flag("v", "mte2", g % 2)
                             T.copy(
@@ -544,14 +555,25 @@ def build_sparse_attn_sharedkv(
                             T.tile.fill(sumexp, 1.0)
                             T.barrier_all()
                             T.wait_flag("mte2", "v", pv1)
-                            T.copy(mask_ub[pv1, :], mask_sel)
-                            for h_i in T.serial(v_block):
-                                T.tile.select(
-                                    acc_s_ub[h_i, :],
-                                    mask_sel,
-                                    acc_s_ub_[pv1 * v_block + h_i, :],
-                                    -T.infinity(accum_dtype),
-                                    "VSEL_TENSOR_SCALAR_MODE",
+                            if s_global1 < ori_win_left:
+                                # Partial window: mask future keys to -inf per head.
+                                T.copy(mask_ub[pv1, :], mask_sel)
+                                for h_i in T.serial(v_block):
+                                    T.tile.select(
+                                        acc_s_ub[h_i, :],
+                                        mask_sel,
+                                        acc_s_ub_[pv1 * v_block + h_i, :],
+                                        -T.infinity(accum_dtype),
+                                        "VSEL_TENSOR_SCALAR_MODE",
+                                    )
+                            else:
+                                # Full window: every loaded key is valid -> one
+                                # batched move (no per-head select).
+                                T.copy(
+                                    acc_s_ub_[
+                                        pv1 * v_block : pv1 * v_block + v_block, :
+                                    ],
+                                    acc_s_ub,
                                 )
                             T.set_flag("v", "mte2", pv1)
                             T.copy(m_i, m_i_prev)
@@ -604,13 +626,23 @@ def build_sparse_attn_sharedkv(
                                 acc_o_work,
                             )
                             T.set_flag("mte2", "v", 2)
+                            # Batched normalize O[h,:] /= sumexp[h]: one reciprocal
+                            # over all heads, then a per-row broadcast multiply
+                            # (brcb + row_muls) -- replaces the per-head div loop.
+                            T.tile.reciprocal(recip, sumexp_rt)
+                            T.pipe_barrier("v")
                             T.wait_flag("mte2", "v", 2)
-                            for h_i in range(MERGE_HEADS):
-                                T.tile.div(
-                                    acc_o_work[h_i, :],
-                                    acc_o_work[h_i, :],
-                                    sumexp_rt[h_i],
-                                )
+                            T.tile.brcb(
+                                recip_brd8,
+                                recip[0:MERGE_HEADS],
+                                (MERGE_HEADS + 7) // 8,
+                                1,
+                                8,
+                            )
+                            T.pipe_barrier("v")
+                            T.tile.row_muls(
+                                acc_o_work, acc_o_work, recip_brd8, MERGE_HEADS, D, D
+                            )
                             T.pipe_barrier("v")
                             T.copy(acc_o_work, acc_o_half[0:MERGE_HEADS, :])
                             T.copy(
@@ -625,12 +657,17 @@ def build_sparse_attn_sharedkv(
                             )
                             T.set_flag("mte2", "v", 3)
                             T.wait_flag("mte2", "v", 3)
-                            for h_i in range(MERGE_HEADS):
-                                T.tile.div(
-                                    acc_o_work2[h_i, :],
-                                    acc_o_work2[h_i, :],
-                                    sumexp_rt[MERGE_HEADS + h_i],
-                                )
+                            T.tile.brcb(
+                                recip_brd8,
+                                recip[MERGE_HEADS : 2 * MERGE_HEADS],
+                                (MERGE_HEADS + 7) // 8,
+                                1,
+                                8,
+                            )
+                            T.pipe_barrier("v")
+                            T.tile.row_muls(
+                                acc_o_work2, acc_o_work2, recip_brd8, MERGE_HEADS, D, D
+                            )
                             T.pipe_barrier("v")
                             T.copy(
                                 acc_o_work2,
