@@ -504,12 +504,22 @@ def build_sparse_attn_sharedkv(
                             )
                             T.set_flag("m", "fix", 2)
                             # Drain L0C scores to the GM workspace (two halves).
+                            # T.fixpipe = faithful Ascend C ComputeMm1 Fixpipe
+                            # (raw AscendC::Fixpipe, bypasses catlass). unit_flag=0
+                            # keeps the explicit m->fix/fix->m sync for now; B2
+                            # flips it to 0b11 to elide the M->FIX barrier.
                             T.wait_flag("m", "fix", 0)
-                            T.copy(acc_s_a, ws_score[cid, pa, 0:H_per_block, 0:BI_half])
+                            T.fixpipe(
+                                acc_s_a,
+                                ws_score[cid, pa, 0:H_per_block, 0:BI_half],
+                                unit_flag=0,
+                            )
                             T.set_flag("fix", "m", 0)
                             T.wait_flag("m", "fix", 2)
-                            T.copy(
-                                acc_s_b, ws_score[cid, pa, 0:H_per_block, BI_half:BI]
+                            T.fixpipe(
+                                acc_s_b,
+                                ws_score[cid, pa, 0:H_per_block, BI_half:BI],
+                                unit_flag=0,
                             )
                             T.set_flag("fix", "m", 1)
                             T.set_cross_flag("FIX", _FLAG_SCORE_READY)
