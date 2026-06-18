@@ -478,8 +478,12 @@ def build_sparse_attn_sharedkv(
                                     kv_hi[pa, n_hi:BI_half, :],
                                 )
                             T.set_flag("mte2", "m", 5)
-                            # --- Q@K^T LO half: needs Q (3) + kv_lo (4); runs while
-                            # kv_hi (5) is still loading on MTE2. ---
+                            # --- Q@K^T LO half + Fixpipe, faithful ComputeMm1:
+                            # the gemm's last Mmad sets unitFlag 0b11 and the
+                            # immediately-following Fixpipe (unit_flag=0b11)
+                            # consumes it, so NO explicit m->fix/fix->m barrier
+                            # between Mmad and Fixpipe. kv_lo (4) + Q (3) ready;
+                            # kv_hi (5) keeps streaming on MTE2 meanwhile. ---
                             T.wait_flag("mte2", "m", 3)
                             T.wait_flag("mte2", "m", 4)
                             T.wait_flag("fix", "m", 0)
@@ -489,10 +493,16 @@ def build_sparse_attn_sharedkv(
                                 acc_s_a,
                                 transpose_B=True,
                                 init=True,
+                                unit_flag=True,
                             )
-                            T.set_flag("m", "fix", 0)
-                            # --- Q@K^T HI half: kv_hi (5) finished loading during the
-                            # LO gemm above. ---
+                            T.fixpipe(
+                                acc_s_a,
+                                ws_score[cid, pa, 0:H_per_block, 0:BI_half],
+                                unit_flag=0b11,
+                            )
+                            T.set_flag("fix", "m", 0)
+                            # --- Q@K^T HI half + Fixpipe (kv_hi finished loading
+                            # during the LO gemm/fixpipe above). ---
                             T.wait_flag("mte2", "m", 5)
                             T.wait_flag("fix", "m", 1)
                             T.gemm_v0(
@@ -501,25 +511,12 @@ def build_sparse_attn_sharedkv(
                                 acc_s_b,
                                 transpose_B=True,
                                 init=True,
+                                unit_flag=True,
                             )
-                            T.set_flag("m", "fix", 2)
-                            # Drain L0C scores to the GM workspace (two halves).
-                            # T.fixpipe = faithful Ascend C ComputeMm1 Fixpipe
-                            # (raw AscendC::Fixpipe, bypasses catlass). unit_flag=0
-                            # keeps the explicit m->fix/fix->m sync for now; B2
-                            # flips it to 0b11 to elide the M->FIX barrier.
-                            T.wait_flag("m", "fix", 0)
-                            T.fixpipe(
-                                acc_s_a,
-                                ws_score[cid, pa, 0:H_per_block, 0:BI_half],
-                                unit_flag=0,
-                            )
-                            T.set_flag("fix", "m", 0)
-                            T.wait_flag("m", "fix", 2)
                             T.fixpipe(
                                 acc_s_b,
                                 ws_score[cid, pa, 0:H_per_block, BI_half:BI],
-                                unit_flag=0,
+                                unit_flag=0b11,
                             )
                             T.set_flag("fix", "m", 1)
                             T.set_cross_flag("FIX", _FLAG_SCORE_READY)
