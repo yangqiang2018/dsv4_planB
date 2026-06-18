@@ -43,6 +43,12 @@ _WANT = ("time", "ratio", "cycle", "mac", "scalar", "mte", "fixpipe", "vec", "du
 _NAME_HINTS = ("op name", "op_name", "opname", "op type", "name")
 
 
+def _norm(s: str) -> str:
+    """Lowercase and drop non-alphanumerics, so 'sparse_attn_sharedkv' and the
+    Ascend C 'SparseAttnSharedkv' compare equal."""
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
 def _find_name_col(header: list[str]) -> int:
     low = [h.strip().lower() for h in header]
     for hint in _NAME_HINTS:
@@ -61,7 +67,7 @@ def _want_cols(header: list[str]) -> list[int]:
     return out
 
 
-def parse_csv(path: str, match: str) -> None:
+def parse_csv(path: str, match: str, exclude: str = "metadata") -> None:
     with open(path, newline="") as f:
         rows = list(csv.reader(f))
     if not rows:
@@ -73,6 +79,8 @@ def parse_csv(path: str, match: str) -> None:
     print(f"=== {os.path.basename(path)} ===")
     print(f"op-name column: [{name_col}] {header[name_col]!r}")
 
+    nmatch = _norm(match)
+    nexcl = _norm(exclude) if exclude else ""
     names = []
     hits = []
     for r in rows[1:]:
@@ -80,7 +88,10 @@ def parse_csv(path: str, match: str) -> None:
             continue
         nm = r[name_col].strip()
         names.append(nm)
-        if match.lower() in nm.lower():
+        nn = _norm(nm)
+        # Match on normalized name (underscore/case-insensitive); skip the
+        # separate metadata op which also contains "SharedkvMetadata".
+        if nmatch in nn and (not nexcl or nexcl not in nn):
             hits.append(r)
 
     print(f"distinct op names ({len(set(names))}): {sorted(set(names))[:40]}")
@@ -135,11 +146,16 @@ def main() -> None:
     ap.add_argument("--scenario", default="swa_prefill")
     ap.add_argument("--csv", default=None, help="parse an existing op_summary CSV")
     ap.add_argument("--match", default="sparse_attn_sharedkv", help="op-name filter")
+    ap.add_argument(
+        "--exclude",
+        default="metadata",
+        help="skip op names containing this (normalized); '' to disable",
+    )
     ap.add_argument("--outdir", default=None, help="msprof output dir")
     args = ap.parse_args()
 
     if args.csv:
-        parse_csv(args.csv, args.match)
+        parse_csv(args.csv, args.match, args.exclude)
         return
 
     outdir = args.outdir or f"./prof_{args.impl}_{args.scenario}"
@@ -147,7 +163,7 @@ def main() -> None:
     csv_path = collect(args.impl, args.scenario, outdir)
     if csv_path:
         print()
-        parse_csv(csv_path, args.match)
+        parse_csv(csv_path, args.match, args.exclude)
     else:
         sys.exit(1)
 
