@@ -220,6 +220,9 @@ def build_sparse_attn_sharedkv(
                 sumexp = T.alloc_ub([ub_len], accum_dtype)
                 sumexp_i_ub = T.alloc_ub([ub_len], accum_dtype)
                 lse_ub = T.alloc_ub([ub_len], accum_dtype)
+                # Per-head sink logits, loaded from GM ONCE before the loop
+                # (constant per head; Ascend C's CopySinksIn is also one-shot).
+                sinks_ub = T.alloc_ub([ub_len], accum_dtype)
                 alpha = T.alloc_ub([2 * ub_len], accum_dtype)
                 alpha_exp = T.alloc_ub([ub_len], accum_dtype)
                 acc_s_ub = T.alloc_ub([v_block, BI], accum_dtype)
@@ -260,6 +263,7 @@ def build_sparse_attn_sharedkv(
                         sumexp: ub_addr["sumexp"],
                         sumexp_i_ub: ub_addr["sumexp_i_ub"],
                         lse_ub: ub_addr["lse_ub"],
+                        sinks_ub: ub_addr["sinks_ub"],
                         idx_int: ub_addr["idx_int"],
                         idx_float: ub_addr["idx_float"],
                         alpha: ub_addr["alpha"],
@@ -468,6 +472,10 @@ def build_sparse_attn_sharedkv(
 
                 # =========================== VECTOR ===========================
                 with T.Scope("V"):
+                    # Load this lane's 32 sink logits once (constant per head).
+                    T.copy(Sinks[vid * v_block : vid * v_block + v_block], sinks_ub)
+                    T.set_flag("mte2", "v", 4)
+                    T.wait_flag("mte2", "v", 4)
                     T.set_flag("v", "mte2", 0)
                     T.set_flag("v", "mte2", 1)
                     for g in T.serial(total_work + 2):
@@ -524,14 +532,14 @@ def build_sparse_attn_sharedkv(
                             if s_global0 < ori_win_left:
                                 T.tile.createvecindex(idx_int, ori_left0)
                                 T.copy(idx_int, idx_float)
-                                T.barrier_all()
+                                T.pipe_barrier("v")
                                 T.tile.compare(
                                     mask_ub[g % 2, :],
                                     idx_float,
                                     T.float32(ori_right0),
                                     "LE",
                                 )
-                                T.barrier_all()
+                                T.pipe_barrier("v")
                             T.wait_cross_flag(_FLAG_SCORE_READY)
                             T.wait_flag("v", "mte2", g % 2)
                             T.copy(
@@ -551,9 +559,9 @@ def build_sparse_attn_sharedkv(
                             pv1 = (g - 1) % 2
                             # Sink-seeded online softmax (single tile): seed running
                             # max with per-head sink logit, sum with exp(0)=1.
-                            T.copy(Sinks[vid * v_block : vid * v_block + v_block], m_i)
+                            T.copy(sinks_ub, m_i)
                             T.tile.fill(sumexp, 1.0)
-                            T.barrier_all()
+                            T.pipe_barrier("v")
                             T.wait_flag("mte2", "v", pv1)
                             if s_global1 < ori_win_left:
                                 # Partial window: mask future keys to -inf per head.
@@ -605,17 +613,19 @@ def build_sparse_attn_sharedkv(
                                     cid, pv1, vid * v_block : vid * v_block + v_block, :
                                 ],
                             )
-                            T.barrier_all()
+                            # The cross-flag is MTE3-tied, so it already fences the
+                            # ws_p copy above -- no PIPE_ALL barrier needed.
                             T.set_cross_flag("MTE3", _FLAG_P_READY)
 
                         if valid2:
                             pv2 = (g - 2) % 2
                             # Normalize O = (P@V) / sumexp, per head, and write out.
+                            # PV_READY (a cross-core flag) already fences the cube's
+                            # ws_o write; no PIPE_ALL barrier needed after the wait.
                             T.wait_cross_flag(_FLAG_PV_READY)
-                            T.barrier_all()
                             T.copy(sumexp_sv[pv2, :], sumexp_rt)
                             T.copy(m_i_sv[pv2, :], m_i_rt)
-                            T.barrier_all()
+                            T.pipe_barrier("v")
                             T.copy(
                                 ws_o[
                                     cid,
@@ -681,9 +691,12 @@ def build_sparse_attn_sharedkv(
                             )
                             # LSE = ln(sum) + max  (sink already folded into both).
                             T.tile.ln(lse_ub, sumexp_rt)
-                            T.barrier_all()
+                            T.pipe_barrier("v")
                             T.tile.add(lse_ub, lse_ub, m_i_rt)
-                            T.barrier_all()
+                            # Add (V) writes lse_ub; the GM store is MTE3 -> fence
+                            # with a V_MTE3 event, not a PIPE_ALL barrier.
+                            T.set_flag("v", "mte3", 2)
+                            T.wait_flag("v", "mte3", 2)
                             T.copy(
                                 lse_ub,
                                 LSE_out[t2, vid * v_block : vid * v_block + v_block],

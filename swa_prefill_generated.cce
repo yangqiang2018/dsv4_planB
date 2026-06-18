@@ -1,0 +1,729 @@
+#include "tl_templates/ascend/common.h"
+#include "acl/acl.h"
+#include <runtime/rt_ffts.h>
+using namespace Catlass;
+using uint = unsigned int;
+using uchar = unsigned char;
+using ushort = unsigned short;
+
+extern "C" __global__ __aicore__ void sparse_attn_sharedkv_swa_kernel( GM_ADDR Q_handle,  GM_ADDR ori_KV_handle,  GM_ADDR ori_block_table_handle,  GM_ADDR cmp_KV_handle,  GM_ADDR cmp_block_table_handle,  GM_ADDR cmp_indices_handle,  GM_ADDR q_prefix_handle,  GM_ADDR actual_q_len_handle,  GM_ADDR actual_kv_len_handle,  GM_ADDR Sinks_handle,  GM_ADDR Metadata_handle,  GM_ADDR Output_handle,  GM_ADDR LSE_out_handle,  GM_ADDR ws_kv_handle,  GM_ADDR ws_score_handle,  GM_ADDR ws_p_handle,  GM_ADDR ws_o_handle,  GM_ADDR ws_acc_o_handle, uint64_t fftsAddr) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+  AscendC::TPipe pipe;
+
+  AscendC::GlobalTensor<bfloat16_t> Q;
+  Q.SetGlobalBuffer((__gm__ bfloat16_t*)Q_handle);
+  AscendC::GlobalTensor<bfloat16_t> ori_KV;
+  ori_KV.SetGlobalBuffer((__gm__ bfloat16_t*)ori_KV_handle);
+  AscendC::GlobalTensor<int> ori_block_table;
+  ori_block_table.SetGlobalBuffer((__gm__ int*)ori_block_table_handle);
+  AscendC::GlobalTensor<bfloat16_t> cmp_KV;
+  cmp_KV.SetGlobalBuffer((__gm__ bfloat16_t*)cmp_KV_handle);
+  AscendC::GlobalTensor<int> cmp_block_table;
+  cmp_block_table.SetGlobalBuffer((__gm__ int*)cmp_block_table_handle);
+  AscendC::GlobalTensor<int> cmp_indices;
+  cmp_indices.SetGlobalBuffer((__gm__ int*)cmp_indices_handle);
+  AscendC::GlobalTensor<int> q_prefix;
+  q_prefix.SetGlobalBuffer((__gm__ int*)q_prefix_handle);
+  AscendC::GlobalTensor<int> actual_q_len;
+  actual_q_len.SetGlobalBuffer((__gm__ int*)actual_q_len_handle);
+  AscendC::GlobalTensor<int> actual_kv_len;
+  actual_kv_len.SetGlobalBuffer((__gm__ int*)actual_kv_len_handle);
+  AscendC::GlobalTensor<float> Sinks;
+  Sinks.SetGlobalBuffer((__gm__ float*)Sinks_handle);
+  AscendC::GlobalTensor<int> Metadata;
+  Metadata.SetGlobalBuffer((__gm__ int*)Metadata_handle);
+  AscendC::GlobalTensor<bfloat16_t> Output;
+  Output.SetGlobalBuffer((__gm__ bfloat16_t*)Output_handle);
+  AscendC::GlobalTensor<float> LSE_out;
+  LSE_out.SetGlobalBuffer((__gm__ float*)LSE_out_handle);
+  AscendC::GlobalTensor<bfloat16_t> ws_kv;
+  ws_kv.SetGlobalBuffer((__gm__ bfloat16_t*)ws_kv_handle);
+  AscendC::GlobalTensor<float> ws_score;
+  ws_score.SetGlobalBuffer((__gm__ float*)ws_score_handle);
+  AscendC::GlobalTensor<bfloat16_t> ws_p;
+  ws_p.SetGlobalBuffer((__gm__ bfloat16_t*)ws_p_handle);
+  AscendC::GlobalTensor<float> ws_o;
+  ws_o.SetGlobalBuffer((__gm__ float*)ws_o_handle);
+  AscendC::GlobalTensor<float> ws_acc_o;
+  ws_acc_o.SetGlobalBuffer((__gm__ float*)ws_acc_o_handle);
+
+  AscendC::TBuf<AscendC::TPosition::A2> ascend_l0a;
+  pipe.InitBuffer(ascend_l0a, 65536);
+  AscendC::TBuf<AscendC::TPosition::B2> ascend_l0b;
+  pipe.InitBuffer(ascend_l0b, 65536);
+  AscendC::TBuf<AscendC::TPosition::A1> ascend_l1; pipe.InitBuffer(ascend_l1, 524032);
+  AscendC::TBuf<AscendC::TPosition::CO1> ascend_l0c; pipe.InitBuffer(ascend_l0c, 131072);
+  AscendC::TBuf<AscendC::TPosition::VECCALC> ascend_ub; pipe.InitBuffer(ascend_ub, 196352);
+  pipe.Destroy();
+  auto cid = AscendC::GetBlockIdx();
+  if ASCEND_IS_AIV {
+    cid = cid / 2;
+  }
+  auto q_l1 = ascend_l1.GetWithOffset<bfloat16_t>(65536, 0);
+  auto kv_lo = ascend_l1.GetWithOffset<bfloat16_t>(65536, 131072);
+  auto kv_hi = ascend_l1.GetWithOffset<bfloat16_t>(65536, 262144);
+  auto acc_s_a = ascend_l0c.GetWithOffset<float>(4096, 0);
+  auto acc_s_b = ascend_l0c.GetWithOffset<float>(4096, 65536);
+  auto p_lo = ascend_l1.GetWithOffset<bfloat16_t>(4096, 393216);
+  auto p_hi = ascend_l1.GetWithOffset<bfloat16_t>(4096, 401408);
+  auto acc_o_l0c = ascend_l0c.GetWithOffset<float>(32768, 0);
+  auto idx_int = ascend_ub.GetWithOffset<int>(128, 180992);
+  auto idx_float = ascend_ub.GetWithOffset<float>(128, 181504);
+  auto mask_ub = ascend_ub.GetWithOffset<uint8_t>(64, 182016);
+  auto acc_s_ub_ = ascend_ub.GetWithOffset<float>(8192, 131072);
+  auto m_i = ascend_ub.GetWithOffset<float>(32, 180224);
+  auto sumexp = ascend_ub.GetWithOffset<float>(32, 180480);
+  auto mask_sel = ascend_ub.GetWithOffset<uint8_t>(32, 182528);
+  auto acc_s_ub = ascend_ub.GetWithOffset<float>(4096, 163840);
+  auto m_i_prev = ascend_ub.GetWithOffset<float>(32, 180352);
+  auto sumexp_i_ub = ascend_ub.GetWithOffset<float>(32, 180608);
+  auto alpha_exp = ascend_ub.GetWithOffset<float>(32, 82432);
+  auto softmax_tmp = ascend_ub.GetWithOffset<uint8_t>(16384, 65536);
+  auto alpha = ascend_ub.GetWithOffset<float>(64, 182272);
+  auto sumexp_sv = ascend_ub.GetWithOffset<float>(64, 182560);
+  auto m_i_sv = ascend_ub.GetWithOffset<float>(64, 182816);
+  auto acc_s_half = ascend_ub.GetWithOffset<bfloat16_t>(4096, 98304);
+  auto sumexp_rt = ascend_ub.GetWithOffset<float>(32, 183072);
+  auto m_i_rt = ascend_ub.GetWithOffset<float>(32, 183200);
+  auto acc_o_work = ascend_ub.GetWithOffset<float>(8192, 0);
+  auto recip = ascend_ub.GetWithOffset<float>(32, 183328);
+  auto recip_brd8 = ascend_ub.GetWithOffset<float>(128, 183456);
+  auto acc_o_half = ascend_ub.GetWithOffset<bfloat16_t>(16384, 65536);
+  auto acc_o_work2 = ascend_ub.GetWithOffset<float>(8192, 32768);
+  auto lse_ub = ascend_ub.GetWithOffset<float>(32, 180864);
+  auto vid = AscendC::GetSubBlockIdx();
+  int32_t core_enable = Metadata.GetValue((cid * 8));
+  int32_t bn2_start = Metadata.GetValue(((cid * 8) + 1));
+  int32_t m_start = Metadata.GetValue(((cid * 8) + 2));
+  int32_t bn2_end = Metadata.GetValue(((cid * 8) + 4));
+  int32_t m_end = Metadata.GetValue(((cid * 8) + 5));
+  if ASCEND_IS_AIC {
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(0);
+    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(1);
+    for (int32_t g = 0; g < 8194; ++g) {
+      bool condval;
+      if (((core_enable != 0) && ((((bn2_start * 8192) + m_start) + g) < ((bn2_end * 8192) + m_end)))) {
+        condval = (bool)1;
+      } else {
+        condval = (bool)0;
+      }
+      bool in_range0 = condval;
+      int64_t condval_1;
+      if (in_range0) {
+        condval_1 = (((((int64_t)m_start) + ((int64_t)g)) / (int64_t)8192) + ((int64_t)bn2_start));
+      } else {
+        condval_1 = (int64_t)0;
+      }
+      int32_t act_q0 = actual_q_len.GetValue(condval_1);
+      int64_t condval_2;
+      if (in_range0) {
+        condval_2 = (((((int64_t)m_start) + ((int64_t)g)) / (int64_t)8192) + ((int64_t)bn2_start));
+      } else {
+        condval_2 = (int64_t)0;
+      }
+      int32_t act_kv0 = actual_kv_len.GetValue(condval_2);
+      bool condval_3;
+      if (in_range0) {
+        condval_3 = (((m_start + g) % 8192) < act_q0);
+      } else {
+        condval_3 = (bool)0;
+      }
+      bool valid0 = condval_3;
+      int64_t condval_4;
+      if (in_range0) {
+        condval_4 = (((((int64_t)m_start) + ((int64_t)g)) / (int64_t)8192) + ((int64_t)bn2_start));
+      } else {
+        condval_4 = (int64_t)0;
+      }
+      int32_t t0 = (q_prefix.GetValue(condval_4) + ((m_start + g) % 8192));
+      bool condval_5;
+      if (((core_enable != 0) && ((((bn2_start * 8192) + m_start) + g) <= ((bn2_end * 8192) + m_end)))) {
+        condval_5 = (0 < g);
+      } else {
+        condval_5 = (bool)0;
+      }
+      bool in_range1 = condval_5;
+      bool condval_6;
+      if (in_range1) {
+        condval_6 = ((((m_start + g) + 8191) % 8192) < actual_q_len.GetValue(((((((int64_t)m_start) + ((int64_t)g)) - (int64_t)1) / (int64_t)8192) + ((int64_t)bn2_start))));
+      } else {
+        condval_6 = (bool)0;
+      }
+      bool valid1 = condval_6;
+      bool condval_7;
+      if (((core_enable != 0) && ((((bn2_start * 8192) + m_start) + g) < (((bn2_end * 8192) + m_end) + 2)))) {
+        condval_7 = (2 <= g);
+      } else {
+        condval_7 = (bool)0;
+      }
+      bool in_range2 = condval_7;
+      bool condval_8;
+      if (in_range2) {
+        condval_8 = ((((m_start + g) + 8190) % 8192) < actual_q_len.GetValue(((((((int64_t)m_start) + ((int64_t)g)) - (int64_t)2) / (int64_t)8192) + ((int64_t)bn2_start))));
+      } else {
+        condval_8 = (bool)0;
+      }
+      bool valid2 = condval_8;
+      if (valid2) {
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE2>(0);
+      }
+      if (valid0) {
+        tl::ascend::copy_gm_to_l1<bfloat16_t, 64, 512>(q_l1[((g % 2) * 32768)], Q[(t0 * 32768)], 512, 64, 512, 0);
+        int32_t condval_9;
+        if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+          condval_9 = 0;
+        } else {
+          condval_9 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+        }
+        if ((condval_9 % 128) <= 64) {
+          int32_t condval_10;
+          if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+            condval_10 = 0;
+          } else {
+            condval_10 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+          }
+          if (0 <= condval_10) {
+            int32_t condval_11;
+            if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+              condval_11 = 0;
+            } else {
+              condval_11 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+            }
+            if (condval_11 < 8192) {
+              int32_t condval_12;
+              if (in_range0) {
+                condval_12 = (((m_start + g) / 8192) + bn2_start);
+              } else {
+                condval_12 = 0;
+              }
+              if (0 <= condval_12) {
+                int32_t condval_13;
+                if (in_range0) {
+                  condval_13 = (((m_start + g) / 8192) + bn2_start);
+                } else {
+                  condval_13 = 0;
+                }
+                if (condval_13 < 1) {
+                  int32_t condval_14;
+                  if (in_range0) {
+                    condval_14 = (((m_start + g) / 8192) + bn2_start);
+                  } else {
+                    condval_14 = 0;
+                  }
+                  int32_t condval_15;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_15 = 0;
+                  } else {
+                    condval_15 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  int32_t condval_16;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_16 = 0;
+                  } else {
+                    condval_16 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  tl::ascend::copy_gm_to_l1<bfloat16_t, 64, 512>(kv_lo[((g % 2) * 32768)], ori_KV[((ori_block_table.GetValue(((condval_14 * 64) + (condval_15 / 128))) * 65536) + ((condval_16 % 128) * 512))], 512, 64, 512, 0);
+                }
+              }
+            }
+          }
+        } else {
+          int32_t condval_17;
+          if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+            condval_17 = 0;
+          } else {
+            condval_17 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+          }
+          if (0 <= condval_17) {
+            int32_t condval_18;
+            if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+              condval_18 = 0;
+            } else {
+              condval_18 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+            }
+            if (condval_18 < 8192) {
+              int32_t condval_19;
+              if (in_range0) {
+                condval_19 = (((m_start + g) / 8192) + bn2_start);
+              } else {
+                condval_19 = 0;
+              }
+              if (0 <= condval_19) {
+                int32_t condval_20;
+                if (in_range0) {
+                  condval_20 = (((m_start + g) / 8192) + bn2_start);
+                } else {
+                  condval_20 = 0;
+                }
+                if (condval_20 < 1) {
+                  int32_t condval_21;
+                  if (in_range0) {
+                    condval_21 = (((m_start + g) / 8192) + bn2_start);
+                  } else {
+                    condval_21 = 0;
+                  }
+                  int32_t condval_22;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_22 = 0;
+                  } else {
+                    condval_22 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  int32_t condval_23;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_23 = 0;
+                  } else {
+                    condval_23 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  int32_t condval_24;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_24 = 0;
+                  } else {
+                    condval_24 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  tl::ascend::copy_gm_to_l1<bfloat16_t, 64, 512>(kv_lo[((g % 2) * 32768)], ori_KV[((ori_block_table.GetValue(((condval_21 * 64) + (condval_22 / 128))) * 65536) + ((condval_23 % 128) * 512))], 512, (128 - (condval_24 % 128)), 512, 1);
+                }
+              }
+            }
+          }
+          int32_t condval_25;
+          if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+            condval_25 = 0;
+          } else {
+            condval_25 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+          }
+          if (-128 <= condval_25) {
+            int32_t condval_26;
+            if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+              condval_26 = 0;
+            } else {
+              condval_26 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+            }
+            if (condval_26 < 8064) {
+              int32_t condval_27;
+              if (in_range0) {
+                condval_27 = (((m_start + g) / 8192) + bn2_start);
+              } else {
+                condval_27 = 0;
+              }
+              if (0 <= condval_27) {
+                int32_t condval_28;
+                if (in_range0) {
+                  condval_28 = (((m_start + g) / 8192) + bn2_start);
+                } else {
+                  condval_28 = 0;
+                }
+                if (condval_28 < 1) {
+                  int32_t condval_29;
+                  if (in_range0) {
+                    condval_29 = (((m_start + g) / 8192) + bn2_start);
+                  } else {
+                    condval_29 = 0;
+                  }
+                  int32_t condval_30;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_30 = 0;
+                  } else {
+                    condval_30 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  int32_t condval_31;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_31 = 0;
+                  } else {
+                    condval_31 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  int32_t condval_32;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_32 = 0;
+                  } else {
+                    condval_32 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  tl::ascend::copy_gm_to_l1<bfloat16_t, 64, 512>(kv_lo[((((g % 2) * 32768) + 2048) - ((condval_31 % 128) * 16))], ori_KV[(ori_block_table.GetValue((((condval_29 * 64) + (condval_30 / 128)) + 1)) * 65536)], 512, ((condval_32 % 128) - 64), 512, 1);
+                }
+              }
+            }
+          }
+        }
+        int32_t condval_33;
+        if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+          condval_33 = 0;
+        } else {
+          condval_33 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+        }
+        if (((condval_33 + 64) % 128) <= 64) {
+          int32_t condval_34;
+          if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+            condval_34 = 0;
+          } else {
+            condval_34 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+          }
+          if (-64 <= condval_34) {
+            int32_t condval_35;
+            if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+              condval_35 = 0;
+            } else {
+              condval_35 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+            }
+            if (condval_35 < 8128) {
+              int32_t condval_36;
+              if (in_range0) {
+                condval_36 = (((m_start + g) / 8192) + bn2_start);
+              } else {
+                condval_36 = 0;
+              }
+              if (0 <= condval_36) {
+                int32_t condval_37;
+                if (in_range0) {
+                  condval_37 = (((m_start + g) / 8192) + bn2_start);
+                } else {
+                  condval_37 = 0;
+                }
+                if (condval_37 < 1) {
+                  int32_t condval_38;
+                  if (in_range0) {
+                    condval_38 = (((m_start + g) / 8192) + bn2_start);
+                  } else {
+                    condval_38 = 0;
+                  }
+                  int32_t condval_39;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_39 = 0;
+                  } else {
+                    condval_39 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  int32_t condval_40;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_40 = 0;
+                  } else {
+                    condval_40 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  tl::ascend::copy_gm_to_l1<bfloat16_t, 64, 512>(kv_hi[((g % 2) * 32768)], ori_KV[((ori_block_table.GetValue(((condval_38 * 64) + ((condval_39 + 64) / 128))) * 65536) + (((condval_40 + 64) % 128) * 512))], 512, 64, 512, 0);
+                }
+              }
+            }
+          }
+        } else {
+          int32_t condval_41;
+          if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+            condval_41 = 0;
+          } else {
+            condval_41 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+          }
+          if (-64 <= condval_41) {
+            int32_t condval_42;
+            if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+              condval_42 = 0;
+            } else {
+              condval_42 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+            }
+            if (condval_42 < 8128) {
+              int32_t condval_43;
+              if (in_range0) {
+                condval_43 = (((m_start + g) / 8192) + bn2_start);
+              } else {
+                condval_43 = 0;
+              }
+              if (0 <= condval_43) {
+                int32_t condval_44;
+                if (in_range0) {
+                  condval_44 = (((m_start + g) / 8192) + bn2_start);
+                } else {
+                  condval_44 = 0;
+                }
+                if (condval_44 < 1) {
+                  int32_t condval_45;
+                  if (in_range0) {
+                    condval_45 = (((m_start + g) / 8192) + bn2_start);
+                  } else {
+                    condval_45 = 0;
+                  }
+                  int32_t condval_46;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_46 = 0;
+                  } else {
+                    condval_46 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  int32_t condval_47;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_47 = 0;
+                  } else {
+                    condval_47 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  int32_t condval_48;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_48 = 0;
+                  } else {
+                    condval_48 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  tl::ascend::copy_gm_to_l1<bfloat16_t, 64, 512>(kv_hi[((g % 2) * 32768)], ori_KV[((ori_block_table.GetValue(((condval_45 * 64) + ((condval_46 + 64) / 128))) * 65536) + (((condval_47 + 64) % 128) * 512))], 512, (128 - ((condval_48 + 64) % 128)), 512, 1);
+                }
+              }
+            }
+          }
+          int32_t condval_49;
+          if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+            condval_49 = 0;
+          } else {
+            condval_49 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+          }
+          if (-192 <= condval_49) {
+            int32_t condval_50;
+            if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+              condval_50 = 0;
+            } else {
+              condval_50 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+            }
+            if (condval_50 < 8000) {
+              int32_t condval_51;
+              if (in_range0) {
+                condval_51 = (((m_start + g) / 8192) + bn2_start);
+              } else {
+                condval_51 = 0;
+              }
+              if (0 <= condval_51) {
+                int32_t condval_52;
+                if (in_range0) {
+                  condval_52 = (((m_start + g) / 8192) + bn2_start);
+                } else {
+                  condval_52 = 0;
+                }
+                if (condval_52 < 1) {
+                  int32_t condval_53;
+                  if (in_range0) {
+                    condval_53 = (((m_start + g) / 8192) + bn2_start);
+                  } else {
+                    condval_53 = 0;
+                  }
+                  int32_t condval_54;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_54 = 0;
+                  } else {
+                    condval_54 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  int32_t condval_55;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_55 = 0;
+                  } else {
+                    condval_55 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  int32_t condval_56;
+                  if ((((act_kv0 + ((m_start + g) % 8192)) - act_q0) < 127)) {
+                    condval_56 = 0;
+                  } else {
+                    condval_56 = (((act_kv0 + ((m_start + g) % 8192)) - act_q0) - 127);
+                  }
+                  tl::ascend::copy_gm_to_l1<bfloat16_t, 64, 512>(kv_hi[((((g % 2) * 32768) + 2048) - (((condval_55 + 64) % 128) * 16))], ori_KV[(ori_block_table.GetValue((((condval_53 * 64) + ((condval_54 + 64) / 128)) + 1)) * 65536)], 512, (((condval_56 + 64) % 128) - 64), 512, 1);
+                }
+              }
+            }
+          }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_M>(3);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_M>(3);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
+        tl::ascend::gemm_v0<bfloat16_t, float, 64, 64, 512, false, true>(q_l1[((g % 2) * 32768)], kv_lo[((g % 2) * 32768)], acc_s_a[0], ascend_l0a, ascend_l0b, (bool)1);
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
+        tl::ascend::gemm_v0<bfloat16_t, float, 64, 64, 512, false, true>(q_l1[((g % 2) * 32768)], kv_hi[((g % 2) * 32768)], acc_s_b[0], ascend_l0a, ascend_l0b, (bool)1);
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(2);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(0);
+        tl::ascend::copy_l0c_to_gm<float, float, layout::RowMajor, 64, 64, 0>(ws_score[((cid * 16384) + ((g % 2) * 8192))], acc_s_a[0], 128, 64, 64);
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(2);
+        tl::ascend::copy_l0c_to_gm<float, float, layout::RowMajor, 64, 64, 0>(ws_score[(((cid * 16384) + ((g % 2) * 8192)) + 64)], acc_s_b[0], 128, 64, 64);
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(1);
+        AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(1);
+      }
+      if (valid1) {
+        AscendC::CrossCoreWaitFlag(2);
+        tl::ascend::copy_gm_to_l1<bfloat16_t, 64, 64>(p_lo[0], ws_p[((cid * 16384) + (((g + 1) % 2) * 8192))], 128, 64, 64, 0);
+        tl::ascend::copy_gm_to_l1<bfloat16_t, 64, 64>(p_hi[0], ws_p[(((cid * 16384) + (((g + 1) % 2) * 8192)) + 64)], 128, 64, 64, 0);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_M>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_M>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
+        tl::ascend::gemm_v0<bfloat16_t, float, 64, 512, 64, false, false>(p_lo[0], kv_lo[(((g + 1) % 2) * 32768)], acc_o_l0c[0], ascend_l0a, ascend_l0b, (bool)1);
+        tl::ascend::gemm_v0<bfloat16_t, float, 64, 512, 64, false, false>(p_hi[0], kv_hi[(((g + 1) % 2) * 32768)], acc_o_l0c[0], ascend_l0a, ascend_l0b, (bool)0);
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE2>(0);
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(1);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(1);
+        tl::ascend::copy_l0c_to_gm<float, float, layout::RowMajor, 64, 512, 0>(ws_o[((cid * 65536) + (((g + 1) % 2) * 32768))], acc_o_l0c[0], 512, 64, 512);
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(0);
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(1);
+        AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(3);
+      }
+    }
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(1);
+  }
+  if ASCEND_IS_AIV {
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
+    for (int32_t g_1 = 0; g_1 < 8194; ++g_1) {
+      bool condval_57;
+      if (((core_enable != 0) && ((((bn2_start * 8192) + m_start) + g_1) < ((bn2_end * 8192) + m_end)))) {
+        condval_57 = (bool)1;
+      } else {
+        condval_57 = (bool)0;
+      }
+      bool in_range0_1 = condval_57;
+      int64_t condval_58;
+      if (in_range0_1) {
+        condval_58 = (((((int64_t)m_start) + ((int64_t)g_1)) / (int64_t)8192) + ((int64_t)bn2_start));
+      } else {
+        condval_58 = (int64_t)0;
+      }
+      int32_t act_q0_1 = actual_q_len.GetValue(condval_58);
+      int64_t condval_59;
+      if (in_range0_1) {
+        condval_59 = (((((int64_t)m_start) + ((int64_t)g_1)) / (int64_t)8192) + ((int64_t)bn2_start));
+      } else {
+        condval_59 = (int64_t)0;
+      }
+      int32_t act_kv0_1 = actual_kv_len.GetValue(condval_59);
+      bool condval_60;
+      if (in_range0_1) {
+        condval_60 = (((m_start + g_1) % 8192) < act_q0_1);
+      } else {
+        condval_60 = (bool)0;
+      }
+      bool valid0_1 = condval_60;
+      bool condval_61;
+      if (((core_enable != 0) && ((((bn2_start * 8192) + m_start) + g_1) <= ((bn2_end * 8192) + m_end)))) {
+        condval_61 = (0 < g_1);
+      } else {
+        condval_61 = (bool)0;
+      }
+      bool in_range1_1 = condval_61;
+      bool condval_62;
+      if (in_range1_1) {
+        condval_62 = ((((m_start + g_1) + 8191) % 8192) < actual_q_len.GetValue(((((((int64_t)m_start) + ((int64_t)g_1)) - (int64_t)1) / (int64_t)8192) + ((int64_t)bn2_start))));
+      } else {
+        condval_62 = (bool)0;
+      }
+      bool valid1_1 = condval_62;
+      int64_t condval_63;
+      if (in_range1_1) {
+        condval_63 = ((((((int64_t)m_start) + ((int64_t)g_1)) - (int64_t)1) / (int64_t)8192) + ((int64_t)bn2_start));
+      } else {
+        condval_63 = (int64_t)0;
+      }
+      int64_t condval_64;
+      if (in_range1_1) {
+        condval_64 = ((((((int64_t)m_start) + ((int64_t)g_1)) - (int64_t)1) / (int64_t)8192) + ((int64_t)bn2_start));
+      } else {
+        condval_64 = (int64_t)0;
+      }
+      int32_t s_global1 = ((actual_kv_len.GetValue(condval_63) + (((m_start + g_1) + 8191) % 8192)) - actual_q_len.GetValue(condval_64));
+      bool condval_65;
+      if (((core_enable != 0) && ((((bn2_start * 8192) + m_start) + g_1) < (((bn2_end * 8192) + m_end) + 2)))) {
+        condval_65 = (2 <= g_1);
+      } else {
+        condval_65 = (bool)0;
+      }
+      bool in_range2_1 = condval_65;
+      bool condval_66;
+      if (in_range2_1) {
+        condval_66 = ((((m_start + g_1) + 8190) % 8192) < actual_q_len.GetValue(((((((int64_t)m_start) + ((int64_t)g_1)) - (int64_t)2) / (int64_t)8192) + ((int64_t)bn2_start))));
+      } else {
+        condval_66 = (bool)0;
+      }
+      bool valid2_1 = condval_66;
+      int64_t condval_67;
+      if (in_range2_1) {
+        condval_67 = ((((((int64_t)m_start) + ((int64_t)g_1)) - (int64_t)2) / (int64_t)8192) + ((int64_t)bn2_start));
+      } else {
+        condval_67 = (int64_t)0;
+      }
+      int32_t t2 = (q_prefix.GetValue(condval_67) + (((m_start + g_1) + 8190) % 8192));
+      if (valid0_1) {
+        if (((act_kv0_1 + ((m_start + g_1) % 8192)) - act_q0_1) < 127) {
+          AscendC::CreateVecIndex<int>(idx_int[0], 0, 128);
+          tl::ascend::copy_ub_to_ub<float, int, 128>(idx_float[0], idx_int[0]);
+          AscendC::PipeBarrier<PIPE_ALL>();
+          AscendC::CompareScalar(mask_ub[((g_1 % 2) * 32)], idx_float[0], ((float)((act_kv0_1 + ((m_start + g_1) % 8192)) - act_q0_1)), AscendC::CMPMODE::LE, 128);
+          AscendC::PipeBarrier<PIPE_ALL>();
+        }
+        AscendC::CrossCoreWaitFlag(1);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>((g_1 % 2));
+        tl::ascend::copy_gm_to_ub<float, 128, 32>(acc_s_ub_[((g_1 % 2) * 4096)], ws_score[(((cid * 16384) + ((g_1 % 2) * 8192)) + (vid * 4096))], 128, 32, 128, 0.000000e+00f);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((g_1 % 2));
+      }
+      if (valid1_1) {
+        tl::ascend::copy_gm_to_ub<float, 32>(m_i[0], Sinks[(vid * 32)], 64, 1, 32, 0.000000e+00f);
+        tl::ascend::Fill<float>(sumexp[0], 1.000000e+00f, 32);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(((g_1 + 1) % 2));
+        if (s_global1 < 127) {
+          tl::ascend::copy_ub_to_ub<uint8_t, uint8_t, 32>(mask_sel[0], mask_ub[(((g_1 + 1) % 2) * 32)]);
+          for (int32_t h_i = 0; h_i < 32; ++h_i) {
+AscendC::Select<float, uint8_t>(acc_s_ub[(h_i * 128)], mask_sel[0], acc_s_ub_[((((g_1 + 1) % 2) * 4096) + (h_i * 128))], static_cast<float>(-CUDART_INF_F), AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, 128);
+          }
+        } else {
+          tl::ascend::copy_ub_to_ub<float, float, 4096>(acc_s_ub[0], acc_s_ub_[(((g_1 + 1) % 2) * 4096)]);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(((g_1 + 1) % 2));
+        tl::ascend::copy_ub_to_ub<float, float, 32>(m_i_prev[0], m_i[0]);
+        {
+        AscendC::Muls(acc_s_ub[0], acc_s_ub[0], 4.419417e-02f, 4096);
+        }
+        tl::ascend::copy_ub_to_ub<float, float, 32>(sumexp_i_ub[0], sumexp[0]);
+        tl::ascend::softmax_flashv2<float>(acc_s_ub[0], sumexp[0], m_i[0], alpha_exp[0], sumexp_i_ub[0], m_i_prev[0], softmax_tmp[0], 32, 128, 128);
+        tl::ascend::copy_ub_to_ub<float, float, 32>(alpha[(((g_1 + 1) % 2) * 32)], alpha_exp[0]);
+        tl::ascend::copy_ub_to_ub<float, float, 32>(sumexp_sv[(((g_1 + 1) % 2) * 32)], sumexp[0]);
+        tl::ascend::copy_ub_to_ub<float, float, 32>(m_i_sv[(((g_1 + 1) % 2) * 32)], m_i[0]);
+        tl::ascend::copy_ub_to_ub<bfloat16_t, float, 4096>(acc_s_half[0], acc_s_ub[0]);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+        tl::ascend::copy_ub_to_gm<bfloat16_t, 128, 32>(ws_p[(((cid * 16384) + (((g_1 + 1) % 2) * 8192)) + (vid * 4096))], acc_s_half[0], 128, 32, 128);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(2);
+      }
+      if (valid2_1) {
+        AscendC::CrossCoreWaitFlag(3);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        tl::ascend::copy_ub_to_ub<float, float, 32>(sumexp_rt[0], sumexp_sv[((g_1 % 2) * 32)]);
+        tl::ascend::copy_ub_to_ub<float, float, 32>(m_i_rt[0], m_i_sv[((g_1 % 2) * 32)]);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        tl::ascend::copy_gm_to_ub<float, 512, 16>(acc_o_work[0], ws_o[(((cid * 65536) + ((g_1 % 2) * 32768)) + (vid * 16384))], 512, 16, 512, 0.000000e+00f);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(2);
+        AscendC::Reciprocal(recip[0], sumexp_rt[0], 32);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(2);
+        tl::ascend::brcb<float>(recip_brd8[0], recip[0], 2, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        tl::ascend::row_muls<float>(acc_o_work[0], acc_o_work[0], recip_brd8[0], 16, 512, 512);
+        AscendC::PipeBarrier<PIPE_V>();
+        tl::ascend::copy_ub_to_ub<bfloat16_t, float, 8192>(acc_o_half[0], acc_o_work[0]);
+        tl::ascend::copy_gm_to_ub<float, 512, 16>(acc_o_work2[0], ws_o[((((cid * 65536) + ((g_1 % 2) * 32768)) + (vid * 16384)) + 8192)], 512, 16, 512, 0.000000e+00f);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(3);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(3);
+        tl::ascend::brcb<float>(recip_brd8[0], recip[16], 2, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        tl::ascend::row_muls<float>(acc_o_work2[0], acc_o_work2[0], recip_brd8[0], 16, 512, 512);
+        AscendC::PipeBarrier<PIPE_V>();
+        tl::ascend::copy_ub_to_ub<bfloat16_t, float, 8192>(acc_o_half[8192], acc_o_work2[0]);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(1);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(1);
+        tl::ascend::copy_ub_to_gm<bfloat16_t, 512, 32>(Output[((t2 * 32768) + (vid * 16384))], acc_o_half[0], 512, 32, 512);
+        AscendC::Ln(lse_ub[0], sumexp_rt[0], 32);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::Add(lse_ub[0], lse_ub[0], m_i_rt[0], 32);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        tl::ascend::copy_ub_to_gm<float, 32>(LSE_out[((t2 * 64) + (vid * 32))], lse_ub[0], 524288, ((t2 <= 8191) ? 1 : 0), 32);
+      }
+    }
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(1);
+  }
+}
+
+void sparse_attn_sharedkv_swa_kernel_tiling() {
+}
+
+extern "C" void call(uint8_t* Q_handle, uint8_t* ori_KV_handle, uint8_t* ori_block_table_handle, uint8_t* cmp_KV_handle, uint8_t* cmp_block_table_handle, uint8_t* cmp_indices_handle, uint8_t* q_prefix_handle, uint8_t* actual_q_len_handle, uint8_t* actual_kv_len_handle, uint8_t* Sinks_handle, uint8_t* Metadata_handle, uint8_t* Output_handle, uint8_t* LSE_out_handle, uint8_t* ws_kv_handle, uint8_t* ws_score_handle, uint8_t* ws_p_handle, uint8_t* ws_o_handle, uint8_t* ws_acc_o_handle, aclrtStream stream) {
+  uint32_t fftsLen{0};
+  uint64_t fftsAddr{0};
+  rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
+  sparse_attn_sharedkv_swa_kernel_tiling();
+  sparse_attn_sharedkv_swa_kernel<<<24, nullptr, stream>>>(Q_handle, ori_KV_handle, ori_block_table_handle, cmp_KV_handle, cmp_block_table_handle, cmp_indices_handle, q_prefix_handle, actual_q_len_handle, actual_kv_len_handle, Sinks_handle, Metadata_handle, Output_handle, LSE_out_handle, ws_kv_handle, ws_score_handle, ws_p_handle, ws_o_handle, ws_acc_o_handle, fftsAddr);
+}
