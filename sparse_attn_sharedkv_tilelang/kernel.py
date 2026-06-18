@@ -399,7 +399,14 @@ def build_sparse_attn_sharedkv(
 
                         if valid0:
                             pa = g % 2
+                            # PRELOAD overlap: issue Q + the two KV-half gathers,
+                            # each with its OWN mte2->m flag, then gemm the LO half as
+                            # soon as Q + kv_lo are in while kv_hi is still streaming
+                            # GM->L1 -- the GM->L1 || Mmad overlap of Ascend C
+                            # ComputeMm1, at half granularity. All inside the QK block,
+                            # so QK still precedes PV (no cross-core deadlock).
                             T.copy(Q[t0, 0:n_heads, 0:D], q_l1[pa, :, :])
+                            T.set_flag("mte2", "m", 3)
                             # --- Paged sliding-window KV gather into kv_lo/kv_hi. ---
                             # Load BI=128 keys starting at ori_left0; ori_block_size
                             # (128) >= BI_half so each 64-row half spans at most two
@@ -436,6 +443,7 @@ def build_sparse_attn_sharedkv(
                                     ],
                                     kv_lo[pa, n_lo:BI_half, :],
                                 )
+                            T.set_flag("mte2", "m", 4)
                             g0_hi = ori_left0 + BI_half
                             bidx_hi = g0_hi // ori_block_size
                             rowc_hi = g0_hi % ori_block_size
@@ -469,9 +477,11 @@ def build_sparse_attn_sharedkv(
                                     ],
                                     kv_hi[pa, n_hi:BI_half, :],
                                 )
-                            T.set_flag("mte2", "m", 3)
+                            T.set_flag("mte2", "m", 5)
+                            # --- Q@K^T LO half: needs Q (3) + kv_lo (4); runs while
+                            # kv_hi (5) is still loading on MTE2. ---
                             T.wait_flag("mte2", "m", 3)
-                            # --- Q@K^T over the two 64-key halves. ---
+                            T.wait_flag("mte2", "m", 4)
                             T.wait_flag("fix", "m", 0)
                             T.gemm_v0(
                                 q_l1[pa, :, :],
@@ -481,6 +491,9 @@ def build_sparse_attn_sharedkv(
                                 init=True,
                             )
                             T.set_flag("m", "fix", 0)
+                            # --- Q@K^T HI half: kv_hi (5) finished loading during the
+                            # LO gemm above. ---
+                            T.wait_flag("mte2", "m", 5)
                             T.wait_flag("fix", "m", 1)
                             T.gemm_v0(
                                 q_l1[pa, :, :],
