@@ -31,6 +31,7 @@ import re
 import sys
 
 import tilelang
+import tvm
 
 sys.path.insert(
     0,
@@ -39,7 +40,7 @@ sys.path.insert(
     ),
 )
 
-from kernel import build_sparse_attn_sharedkv  # noqa: E402
+from kernel import build_sparse_attn_sharedkv, pass_configs  # noqa: E402
 
 # Build params per scenario, mirroring how api.py derives them from the
 # perf/test configs. Only shapes that affect the generated code structure matter.
@@ -134,8 +135,12 @@ def main() -> None:
     )
 
     # Codegen only -- never invokes bisheng, so we get the generated Ascend C even
-    # when the device compile would reject it.
-    artifact = tilelang.lower(prim_func, target="ascendc")
+    # when the device compile would reject it. Apply the SAME pass_configs the JIT
+    # uses (via the PassContext), so the dump reflects the REAL compile path
+    # (AUTO_CV_COMBINE/_CV_SYNC/_SYNC/MEMORY_PLANNING) -- without this the
+    # return_prim_func path lowers with default passes and is misleading.
+    with tvm.transform.PassContext(opt_level=3, config=pass_configs):
+        artifact = tilelang.lower(prim_func, target="ascendc")
     src = artifact.kernel_source
 
     out_path = f"{args.scenario}_generated.cce"

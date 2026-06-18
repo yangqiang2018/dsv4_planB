@@ -34,6 +34,7 @@ import argparse
 import csv
 import glob
 import os
+import shutil
 import subprocess
 import sys
 
@@ -108,7 +109,14 @@ def parse_csv(path: str, match: str, exclude: str = "metadata") -> None:
 
 
 def collect(impl: str, scenario: str, outdir: str) -> str | None:
-    """Run msprof with PipeUtilization, return the op_summary CSV path (or None)."""
+    """Run msprof with PipeUtilization, return the op_summary CSV path (or None).
+
+    msprof drops a fresh ``PROF_*`` subdir per run and never cleans old ones, so
+    we wipe ``outdir`` first and then pick the CSV by newest mtime -- never a
+    stale result from a previous run.
+    """
+    shutil.rmtree(outdir, ignore_errors=True)
+    os.makedirs(outdir, exist_ok=True)
     app = (
         f"python sparse_attn_sharedkv_perf_compare.py "
         f"--scenarios {scenario} --only {impl} --warmup 2 --iters 5"
@@ -128,10 +136,10 @@ def collect(impl: str, scenario: str, outdir: str) -> str | None:
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"\nmsprof failed: {e}")
         return None
-    # Auto-export usually drops CSVs under <outdir>/PROF_*/**/. Glob broadly.
-    cands = sorted(
-        glob.glob(os.path.join(outdir, "**", "*op_summary*.csv"), recursive=True)
-    )
+    # Auto-export usually drops CSVs under <outdir>/PROF_*/**/. Glob broadly and
+    # take the newest by mtime (outdir was wiped above, so this is THIS run's).
+    cands = glob.glob(os.path.join(outdir, "**", "*op_summary*.csv"), recursive=True)
+    cands.sort(key=os.path.getmtime)
     if not cands:
         print(f"\nno op_summary CSV under {outdir}. Try exporting:")
         print(f"  msprof --export=on --output={outdir}/PROF_*")
