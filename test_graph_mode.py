@@ -37,7 +37,12 @@ import torch
 import torch_npu  # noqa: F401  (registers the npu backend)
 
 from sparse_attn_sharedkv_perf_compare import SCENARIOS, build_inputs, stage_on_npu
-from api import _get_kernel, DEFAULT_BLOCK_I, DEFAULT_CORE_NUM
+from api import (
+    _get_kernel,
+    sparse_attn_sharedkv,
+    DEFAULT_BLOCK_I,
+    DEFAULT_CORE_NUM,
+)
 from metadata import sparse_attn_sharedkv_metadata as tl_metadata
 
 
@@ -185,6 +190,65 @@ def bench_graph(func, args, iters=100):
     return (time.perf_counter() - t0) / iters * 1e3
 
 
+def bench_prep(inp, cfg, iters=100):
+    """Time everything api.sparse_attn_sharedkv does BEFORE the `func(...)` line
+    (api.py:186-366): scenario resolve, shape math, the .item() host sync, dummy
+    tensors, .to(device), metadata build, the cached _get_kernel lookup, and the
+    11 .contiguous(). This is the host PREP segment -- the lines the user's model
+    says graph-mode serving "moves out of the loop". It is HOISTABLE (run once),
+    NOT what graph capture removes. build_swa_kernel_call is the faithful replica
+    of exactly this segment, so we time it directly. Warmup first so the JIT
+    compile + kernel cache are hot (per-call is then a dict lookup, the real
+    serving cost)."""
+    for _ in range(10):
+        build_swa_kernel_call(inp, cfg)
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        build_swa_kernel_call(inp, cfg)
+    torch.npu.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3
+
+
+def build_full_api_call(inp, cfg):
+    """Return a thunk running the REAL public api.sparse_attn_sharedkv once
+    (scenario 1 / SWA), exactly as a naive eager serving loop would: ALL the prep
+    (the bench_prep segment) PLUS func() PLUS device, every single call, with
+    metadata rebuilt per call (metadata=None). This is the full per-call host tax
+    a naive loop pays; it should be ~= prep + func_eager."""
+    q = inp["q_npu"]
+    kwargs = dict(
+        ori_kv=inp["ori_pa_npu"],
+        ori_block_table=inp["ori_bt_npu"],
+        cu_seqlens_q=inp["cu_seqlens_q_npu"],
+        seqused_kv=inp["seqused_kv_npu"],
+        sinks=inp["sinks_npu"],
+        softmax_scale=float(cfg["softmax_scale"]),
+        ori_mask_mode=cfg["ori_mask_mode"],
+        ori_win_left=cfg["ori_win_left"],
+        ori_win_right=cfg["ori_win_right"],
+        layout_q="TND",
+        layout_kv="PA_ND",
+        return_softmax_lse=True,
+    )  # cmp_kv / cmp_sparse_indices omitted -> api resolves scenario 1 (SWA)
+
+    def run():
+        return sparse_attn_sharedkv(q, **kwargs)
+
+    return run
+
+
+def bench_thunk(fn, iters=100):
+    for _ in range(10):
+        fn()
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.npu.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3
+
+
 def probe_training(func, args) -> None:
     """Does a gradient flow through the op? (Forward-only kernel -> no grad_fn.)"""
     print("=== training (autograd) probe ===")
@@ -213,21 +277,66 @@ def main():
     probe_training(func, kargs)
 
     print(f"=== timing ({args_.scenario}, iters={args_.iters}) ===")
+
+    # (A) host prep BEFORE the func(...) line -- HOISTED out of the loop by a
+    #     serving loop (run once). This is the segment the user's model points at.
+    prep = bench_prep(inp, cfg, args_.iters)
+    print(
+        f"  (A) host prep BEFORE func()  per-call: {prep:.4f} ms  <- hoist removes (run once)"
+    )
+
+    # (B) func(*args) eager: the kernel-launch call itself (cython plumbing -
+    #     validate/alloc/ptr/lib.call - plus device execution).
     eager = bench_eager(func, kargs, args_.iters)
-    print(f"  eager (kernel-launch only) per-call: {eager:.4f} ms")
+    print(
+        f"  (B) func(*args) eager        per-call: {eager:.4f} ms  <- the launch call"
+    )
+
+    # (C) graph replay of func(*args): device only; (B)'s host plumbing gone.
     graph = bench_graph(func, kargs, args_.iters)
     if graph is not None:
-        print(f"  graph replay               per-call: {graph:.4f} ms")
         print(
-            f"  -> host tax removed by graph: {eager - graph:.4f} ms "
-            f"({100 * (1 - graph / eager):.0f}% faster)"
+            f"  (C) graph replay of func()   per-call: {graph:.4f} ms  <- device only"
+        )
+
+    # (D) full real api call eager: prep + func every call (naive eager serving).
+    full = bench_thunk(build_full_api_call(inp, cfg), args_.iters)
+    print(
+        f"  (D) FULL api eager           per-call: {full:.4f} ms  <- naive serving (~A+B)"
+    )
+
+    print()
+    print("  decomposition (does (D) ~= (A)+(B)? does graph remove (B)'s host part?):")
+    print(f"    naive eager serving / call        = (D)            {full:.4f} ms")
+    print(
+        f"      host prep before func()         = (A)            {prep:.4f} ms   [hoist removes]"
+    )
+    print(f"      func() launch + device          ~ (B)            {eager:.4f} ms")
+    if graph is not None:
+        print(
+            f"        func() HOST plumbing          ~ (B)-(C)        {eager - graph:.4f} ms   [GRAPH CAPTURE removes]"
+        )
+        print(
+            f"        DEVICE work                   ~ (C)            {graph:.4f} ms   [irreducible]"
+        )
+        print(
+            f"    graph-mode serving / call         ~ (C)            {graph:.4f} ms   [prep hoisted + func replayed]"
+        )
+        print(
+            f"    => total host tax removed         = (D)-(C)        {full - graph:.4f} ms "
+            f"({100 * (1 - graph / full):.0f}% of naive)"
         )
     print()
     print("Notes:")
-    print("  * eager here is JUST the kernel launch (func), not the full api call,")
-    print("    so it is the launch tax (~0.5ms) -- the full api adds ~0.4ms prep.")
-    print("  * if graph replay << eager, graph mode removes the host tax. For decode")
-    print("    (tiny device) that is almost the entire latency -> the 9.5% fix.")
+    print("  * The user's model = 'graph hoists the lines before func()'. That is (A),")
+    print("    and (A) IS hoisted -- but by hoisting, not by capture. Graph CAPTURE")
+    print("    additionally removes (B)-(C), the host plumbing INSIDE func(). Both")
+    print("    together is why graph serving (C) << naive serving (D).")
+    print("  * For decode (tiny device (C)) the host tax (A)+(B-C) is almost the whole")
+    print(
+        "    latency -> graph mode is the 9.5% fix. For prefill (C) dominates -> graph"
+    )
+    print("    barely helps (device-bound, already at Ascend C parity).")
     print("  * PREFILL needs ONE graph per shape (static); DECODE is naturally fixed-")
     print("    shape -> the canonical graph use case (decode loop).")
     print("  * TRAINING (gradients): blocked by no-backward (see probe above), not by")
