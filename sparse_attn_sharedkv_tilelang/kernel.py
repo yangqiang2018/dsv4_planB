@@ -182,6 +182,22 @@ def build_sparse_attn_sharedkv(
     is_cfa = scenario >= 2
     NI_cmp_eff = max(NI_cmp, 1)  # workspace tile dim (>=1 so SWA allocs a dummy)
 
+    # CFA cmp-tile paged-gather plan, precomputed at BUILD time (Python ints) so
+    # the kernel body emits constant page indices with NO runtime branch / dead
+    # code (TVMScript turns a Python `if` on a TIR value into an IfThenElse, which
+    # would also static-OOB-index the page table on the untaken branch). Requires
+    # cmp_block_size to be a multiple of BI, so each BI_half KV chunk lies entirely
+    # within one page block (one DataCopy per half).
+    cmp_lo_bidx = cmp_lo_row = cmp_hi_bidx = cmp_hi_row = None
+    if is_cfa:
+        assert cmp_block_size % BI == 0, (
+            "CFA: cmp_block_size must be a multiple of BI (BI-aligned cmp paging)"
+        )
+        cmp_lo_bidx = [(t * BI) // cmp_block_size for t in range(NI_cmp)]
+        cmp_lo_row = [(t * BI) % cmp_block_size for t in range(NI_cmp)]
+        cmp_hi_bidx = [(t * BI + BI_half) // cmp_block_size for t in range(NI_cmp)]
+        cmp_hi_row = [(t * BI + BI_half) % cmp_block_size for t in range(NI_cmp)]
+
     @tilelang.jit(out_idx=[11, 12], workspace_idx=[13, 14, 15, 16, 17, 18])
     def _make():
         # =================================================================
@@ -597,51 +613,27 @@ def build_sparse_attn_sharedkv(
 
                             if is_cfa:
                                 # ---- CFA dense compressed QK: Q @ cmp_kv^T over
-                                # NI_cmp tiles, each covering compressed keys
-                                # [t*BI, t*BI+BI) of this batch's cmp cache
-                                # (dense [0,K); relativeS2Idx=t, s2StartPoint=0).
-                                # Mirrors the ori paged gather but from cmp_KV via
-                                # cmp_block_table/cmp_block_size, reusing acc_s_a/
-                                # acc_s_b (free after the ori fixpipe) and one
-                                # reused cmp KV L1 half. Writes ws_score_cmp; the
-                                # vector merge + cmp PV come next. cmp_block_size /
-                                # tile offsets are compile-time (Python) -> the
-                                # segment split is a compile-time branch. ----
+                                # NI_cmp dense tiles [t*BI, t*BI+BI). Mirrors the
+                                # ori paged gather but from cmp_KV via
+                                # cmp_block_table; reuses acc_s_a/acc_s_b (free
+                                # after the ori fixpipe) and one reused cmp KV L1
+                                # half. Per-tile page indices are precomputed
+                                # (Python ints) -> constant indices, no runtime
+                                # branch. Writes ws_score_cmp; vector merge + cmp
+                                # PV come in the next increment. ----
                                 for tcmp in range(NI_cmp):
-                                    cbase = tcmp * BI
-                                    cbidx_lo = cbase // cmp_block_size
-                                    crowc_lo = cbase % cmp_block_size
-                                    cn_lo = cmp_block_size - crowc_lo
+                                    # -- lo half [t*BI, t*BI+BI_half) (one block) --
                                     T.wait_flag("m", "mte2", 6)
-                                    if cn_lo >= BI_half:
-                                        T.copy(
-                                            cmp_KV[
-                                                cmp_block_table[b0, cbidx_lo],
-                                                crowc_lo : crowc_lo + BI_half,
-                                                0,
-                                                :,
-                                            ],
-                                            cmp_kv_l1[0:BI_half, :],
-                                        )
-                                    else:
-                                        T.copy(
-                                            cmp_KV[
-                                                cmp_block_table[b0, cbidx_lo],
-                                                crowc_lo : crowc_lo + cn_lo,
-                                                0,
-                                                :,
-                                            ],
-                                            cmp_kv_l1[0:cn_lo, :],
-                                        )
-                                        T.copy(
-                                            cmp_KV[
-                                                cmp_block_table[b0, cbidx_lo + 1],
-                                                0 : BI_half - cn_lo,
-                                                0,
-                                                :,
-                                            ],
-                                            cmp_kv_l1[cn_lo:BI_half, :],
-                                        )
+                                    T.copy(
+                                        cmp_KV[
+                                            cmp_block_table[b0, cmp_lo_bidx[tcmp]],
+                                            cmp_lo_row[tcmp] : cmp_lo_row[tcmp]
+                                            + BI_half,
+                                            0,
+                                            :,
+                                        ],
+                                        cmp_kv_l1[0:BI_half, :],
+                                    )
                                     T.set_flag("mte2", "m", 6)
                                     T.wait_flag("mte2", "m", 6)
                                     T.wait_flag("fix", "m", 0)
@@ -662,40 +654,18 @@ def build_sparse_attn_sharedkv(
                                     )
                                     T.set_flag("fix", "m", 0)
                                     T.set_flag("m", "mte2", 6)
-                                    chi = cbase + BI_half
-                                    cbidx_hi = chi // cmp_block_size
-                                    crowc_hi = chi % cmp_block_size
-                                    cn_hi = cmp_block_size - crowc_hi
+                                    # -- hi half [t*BI+BI_half, t*BI+BI) (one block) --
                                     T.wait_flag("m", "mte2", 6)
-                                    if cn_hi >= BI_half:
-                                        T.copy(
-                                            cmp_KV[
-                                                cmp_block_table[b0, cbidx_hi],
-                                                crowc_hi : crowc_hi + BI_half,
-                                                0,
-                                                :,
-                                            ],
-                                            cmp_kv_l1[0:BI_half, :],
-                                        )
-                                    else:
-                                        T.copy(
-                                            cmp_KV[
-                                                cmp_block_table[b0, cbidx_hi],
-                                                crowc_hi : crowc_hi + cn_hi,
-                                                0,
-                                                :,
-                                            ],
-                                            cmp_kv_l1[0:cn_hi, :],
-                                        )
-                                        T.copy(
-                                            cmp_KV[
-                                                cmp_block_table[b0, cbidx_hi + 1],
-                                                0 : BI_half - cn_hi,
-                                                0,
-                                                :,
-                                            ],
-                                            cmp_kv_l1[cn_hi:BI_half, :],
-                                        )
+                                    T.copy(
+                                        cmp_KV[
+                                            cmp_block_table[b0, cmp_hi_bidx[tcmp]],
+                                            cmp_hi_row[tcmp] : cmp_hi_row[tcmp]
+                                            + BI_half,
+                                            0,
+                                            :,
+                                        ],
+                                        cmp_kv_l1[0:BI_half, :],
+                                    )
                                     T.set_flag("mte2", "m", 6)
                                     T.wait_flag("mte2", "m", 6)
                                     T.wait_flag("fix", "m", 1)
