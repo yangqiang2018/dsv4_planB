@@ -53,10 +53,18 @@ except ImportError:
 # perf/test configs. Only shapes that affect the generated code structure matter.
 CONFIGS = {
     "swa_prefill": dict(
-        scenario=1, max_seq=8192, total_tokens=8192, seqused_kv=8192, topk_cmp=0
+        scenario=1, max_seq=8192, total_tokens=8192, seqused_kv=8192, cmp_ratio=4
     ),
     "swa_decode": dict(
-        scenario=1, max_seq=1, total_tokens=1, seqused_kv=8193, topk_cmp=0
+        scenario=1, max_seq=1, total_tokens=1, seqused_kv=8193, cmp_ratio=4
+    ),
+    # CFA (scenario 2): dense compressed pass; cmp_ratio=128 matches the cfa
+    # perf/test config (-> K=128 = 1 cmp tile for these seq lengths).
+    "cfa_prefill": dict(
+        scenario=2, max_seq=8192, total_tokens=8192, seqused_kv=8192, cmp_ratio=128
+    ),
+    "cfa_decode": dict(
+        scenario=2, max_seq=1, total_tokens=1, seqused_kv=8193, cmp_ratio=128
     ),
 }
 
@@ -114,9 +122,26 @@ def main() -> None:
     args = ap.parse_args()
 
     c = CONFIGS[args.scenario]
+    BI = 128
     ori_block_size = 128
     ori_table_len = math.ceil(c["seqused_kv"] / ori_block_size)
     ori_block_num = ori_table_len + 1
+
+    # Compressed (CFA/SCFA) paging, mirroring api.py: K = max(BI, ceil(max_cmp/BI)
+    # *BI) where max_cmp = floor(seqused_kv / cmp_ratio); the cmp paged cache holds
+    # max_cmp tokens at cmp_block_size=128.
+    cmp_ratio = c["cmp_ratio"]
+    if c["scenario"] >= 2:
+        max_cmp = c["seqused_kv"] // cmp_ratio
+        topk_cmp = max(BI, ((max_cmp + BI - 1) // BI) * BI)
+        cmp_block_size = 128
+        cmp_table_len = max(1, math.ceil(max_cmp / cmp_block_size))
+        cmp_block_num = cmp_table_len + 1
+    else:
+        topk_cmp = 0
+        cmp_block_size = 1
+        cmp_table_len = 1
+        cmp_block_num = 1
 
     prim_func = build_sparse_attn_sharedkv(
         batch=1,
@@ -125,14 +150,14 @@ def main() -> None:
         ori_block_num=ori_block_num,
         ori_block_size=ori_block_size,
         ori_table_len=ori_table_len,
-        cmp_block_num=1,
-        cmp_block_size=1,
-        cmp_table_len=1,
+        cmp_block_num=cmp_block_num,
+        cmp_block_size=cmp_block_size,
+        cmp_table_len=cmp_table_len,
         n_heads=64,
         n_kv_heads=1,
         head_dim=512,
-        topk_cmp=c["topk_cmp"],
-        cmp_ratio=4,
+        topk_cmp=topk_cmp,
+        cmp_ratio=cmp_ratio,
         scenario=c["scenario"],
         ori_win_left=127,
         softmax_scale=0.04419417,
