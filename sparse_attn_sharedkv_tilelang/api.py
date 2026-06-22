@@ -47,22 +47,6 @@ from metadata import sparse_attn_sharedkv_metadata, SAS_META_SIZE
 # Module-level kernel cache: key is the tuple of compile-time params.
 _KERNEL_CACHE: dict = {}
 
-# Cache for the read-only dummy/placeholder input tensors (cmp_indices for
-# SWA/CFA, the 1-block cmp KV dummy for SWA). These are never written by the
-# kernel and are fully determined by (shape, dtype, device), so reusing one
-# instance across calls avoids a per-call device alloc + memset. Keyed so a
-# changed shape/dtype/device still allocates correctly.
-_DUMMY_CACHE: dict = {}
-
-
-def _cached_zeros(shape, dtype, device) -> torch.Tensor:
-    key = (tuple(int(s) for s in shape), dtype, str(device))
-    t = _DUMMY_CACHE.get(key)
-    if t is None:
-        t = torch.zeros(shape, dtype=dtype, device=device)
-        _DUMMY_CACHE[key] = t
-    return t
-
 
 def _torch_to_tilelang_dtype(t: torch.dtype) -> str:
     if t == torch.bfloat16:
@@ -223,24 +207,15 @@ def sparse_attn_sharedkv(
     # inputs are reshaped (a free view of the same contiguous memory).
     if layout_q == "TND":
         assert cu_seqlens_q is not None, "cu_seqlens_q is required for TND"
-        # Keep the prefix/length derivation on-device: q_prefix and act_q_lens
-        # are pure slices/diffs of cu_seqlens_q (no host round-trip), and only
-        # the scalar S_max (a compile-time kernel param) needs a device->host
-        # read. The old path did .cpu()+.tolist()+two H2D torch.tensor copies
-        # per call -- avoid those launch-side round-trips.
-        cu = (
-            cu_seqlens_q
-            if cu_seqlens_q.dtype == torch.int32
-            else cu_seqlens_q.to(torch.int32)
-        )
+        cu = cu_seqlens_q.to(torch.int32).cpu()
         B = cu.numel() - 1
-        lens_dev = cu[1:] - cu[:-1]
-        S_max = int(lens_dev.max().item()) if B > 0 else 0
+        seq_lens = (cu[1:] - cu[:-1]).tolist()
+        S_max = max(seq_lens) if seq_lens else 0
         T1, N1, D = q.shape
         total_tokens = T1
         q_flat = q
-        q_prefix = cu[:-1]
-        act_q_lens = lens_dev
+        q_prefix = cu[:-1].to(q.device)
+        act_q_lens = torch.tensor(seq_lens, dtype=torch.int32, device=q.device)
         if scenario == 3:
             cmp_indices_flat = cmp_sparse_indices.to(torch.int32).to(q.device)
         else:
@@ -288,15 +263,17 @@ def sparse_attn_sharedkv(
         # masked out, so over-rounding only adds masked work, not error.
         _bi = DEFAULT_BLOCK_I
         K = max(_bi, ((max_cmp + _bi - 1) // _bi) * _bi)
-        cmp_indices_dev = _cached_zeros((total_tokens, N2, K), torch.int32, q.device)
+        cmp_indices_dev = torch.zeros(
+            (total_tokens, N2, K), dtype=torch.int32, device=q.device
+        )
     else:
         N2 = ori_kv.shape[2]
         K = 0
         # SWA has no cmp pass; the kernel never reads cmp_indices. Pass a
         # minimal one-chunk dummy so the kernel argument stays well-typed.
         # Last dim must match the kernel's indices_shape (max(NI_cmp,1)*BI).
-        cmp_indices_dev = _cached_zeros(
-            (total_tokens, N2, DEFAULT_BLOCK_I), torch.int32, q.device
+        cmp_indices_dev = torch.zeros(
+            (total_tokens, N2, DEFAULT_BLOCK_I), dtype=torch.int32, device=q.device
         )
 
     if N1 != 64 or N2 != 1 or D != 512:
@@ -320,8 +297,8 @@ def sparse_attn_sharedkv(
     else:
         # SWA: no cmp pass (NI_cmp == 0). A 1-block dummy paged cache
         # and block table keep the kernel signature well-typed.
-        cmp_kv_dev = _cached_zeros((1, 1, N2, D), dtype, q.device)
-        cmp_bt_dev = _cached_zeros((B, 1), torch.int32, q.device)
+        cmp_kv_dev = torch.zeros((1, 1, N2, D), dtype=dtype, device=q.device)
+        cmp_bt_dev = torch.zeros((B, 1), dtype=torch.int32, device=q.device)
     cmp_block_num, cmp_block_size = cmp_kv_dev.shape[0], cmp_kv_dev.shape[1]
     cmp_table_len = cmp_bt_dev.shape[1]
 
