@@ -37,6 +37,8 @@ in -- the standard FlashAttention-v2 reverse-pass input.
 
 from __future__ import annotations
 
+import os
+from time import perf_counter
 from typing import Optional, Tuple, Union
 
 import torch
@@ -46,6 +48,11 @@ from metadata import sparse_attn_sharedkv_metadata, SAS_META_SIZE
 
 # Module-level kernel cache: key is the tuple of compile-time params.
 _KERNEL_CACHE: dict = {}
+
+# Optional host-overhead profiling: set SAS_HOST_PROF=1 to print a per-call
+# breakdown of the host (Python/torch) work. Off by default -> zero behavior
+# change. Diagnostic only; never alters the ABI or the result.
+_HOST_PROF = bool(os.environ.get("SAS_HOST_PROF"))
 
 
 def _torch_to_tilelang_dtype(t: torch.dtype) -> str:
@@ -184,6 +191,7 @@ def sparse_attn_sharedkv(
     surfaced to the caller.
     """
     del seqused_q  # API-parity placeholder; kernel does not consume it
+    _hp_t0 = perf_counter() if _HOST_PROF else 0.0
     assert ori_mask_mode == 4, "only ori_mask_mode=4 supported"
     assert cmp_mask_mode == 3 or cmp_kv is None, "only cmp_mask_mode=3 supported"
     assert ori_win_right == 0, "only ori_win_right=0 supported"
@@ -369,6 +377,7 @@ def sparse_attn_sharedkv(
     # The kernel signature has two outputs (Output, LSE_out); jit's
     # out_idx=[11, 12] makes it return a tuple. We always receive both
     # and only forward lse when the caller asked for it.
+    _hp_t1 = perf_counter() if _HOST_PROF else 0.0
     out_flat, lse_flat = func(
         q_flat.contiguous(),
         ori_kv_dev.contiguous(),
@@ -382,6 +391,18 @@ def sparse_attn_sharedkv(
         sinks_dev.contiguous(),
         metadata_dev.contiguous(),
     )
+    if _HOST_PROF:
+        _hp_t2 = perf_counter()
+        # prep = host torch work (dummy allocs, .to/.contiguous, metadata,
+        # cached kernel lookup); launch = JIT dispatch + workspace auto-alloc
+        # + async kernel launch (NOT device exec, which the caller's sync
+        # absorbs). Their sum is the per-call host overhead.
+        print(
+            f"[SAS_HOST_PROF] prep={(_hp_t1 - _hp_t0) * 1e3:.3f}ms  "
+            f"launch={(_hp_t2 - _hp_t1) * 1e3:.3f}ms  "
+            f"(scenario={scenario}, total_tokens={int(total_tokens)})",
+            flush=True,
+        )
 
     # ---- Restore the caller's layout. ----
     # out_flat: [total_tokens, N1, D]; lse_flat: [total_tokens, N1].
