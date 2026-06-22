@@ -68,31 +68,19 @@ def probe_apis() -> None:
     print()
 
 
-def build_swa_kernel_call(inp, cfg):
-    """Replicate api.sparse_attn_sharedkv's SWA (scenario 1) host prep ONCE and
-    return (func, args). Capturing func(*args) captures only the kernel launch --
-    the host prep (shapes, metadata, dummies, the .item() for max_seq) is done
-    here, outside the graph, exactly as a real serving loop would."""
-    q = inp["q_npu"]  # [T1, N1, D], TND
-    dtype = q.dtype
+def build_metadata(inp, cfg):
+    """Build the COMPANION metadata operator's output (TileLang port of
+    SparseAttnSharedkvMetadata). This is a SEPARATE op, OUT of the sharedkv perf
+    scope: in serving AND in sparse_attn_sharedkv_perf_compare it is computed and
+    timed on its own and passed INTO sharedkv via `metadata=...`. The TileLang
+    metadata port is known-slow (~53ms for prefill) and is not what we are
+    optimizing here. Returns the device int32 flat tensor the kernel consumes."""
+    q = inp["q_npu"]
     dev = q.device
     N1, N2, D, B = cfg["N1"], cfg["N2"], cfg["D"], cfg["B"]
-    T1 = q.shape[0]
-
     cu = inp["cu_seqlens_q_npu"].to(torch.int32)
-    q_prefix = cu[:-1].contiguous()
-    act_q_lens = (cu[1:] - cu[:-1]).contiguous()
-    S_max = int(act_q_lens.max().item())
-
-    ori_kv = inp["ori_pa_npu"]
-    ori_bt = inp["ori_bt_npu"].to(torch.int32)
-    cmp_kv = torch.zeros((1, 1, N2, D), dtype=dtype, device=dev)
-    cmp_bt = torch.zeros((B, 1), dtype=torch.int32, device=dev)
-    cmp_idx = torch.zeros((T1, N2, DEFAULT_BLOCK_I), dtype=torch.int32, device=dev)
-    sinks = inp["sinks_npu"].to(torch.float32)
-    seqused_kv = inp["seqused_kv_npu"]
-
-    md = (
+    S_max = int((cu[1:] - cu[:-1]).max().item())
+    return (
         tl_metadata(
             num_heads_q=N1,
             num_heads_kv=N2,
@@ -114,6 +102,33 @@ def build_swa_kernel_call(inp, cfg):
         .to(dev)
         .reshape(-1)
     )
+
+
+def build_swa_kernel_call(inp, cfg, md):
+    """Replicate api.sparse_attn_sharedkv's SWA (scenario 1) host prep and return
+    (func, args), with the metadata operator's output `md` PASSED IN (precomputed
+    once, exactly as a serving loop / perf_compare does -- metadata is a separate
+    op, not part of the sharedkv host prep). This covers only the genuine sharedkv
+    prep: shapes, the .item() for max_seq, dummies, _get_kernel lookup, the 11
+    .contiguous(). Capturing func(*args) captures only the kernel launch."""
+    q = inp["q_npu"]  # [T1, N1, D], TND
+    dtype = q.dtype
+    dev = q.device
+    N1, N2, D, B = cfg["N1"], cfg["N2"], cfg["D"], cfg["B"]
+    T1 = q.shape[0]
+
+    cu = inp["cu_seqlens_q_npu"].to(torch.int32)
+    q_prefix = cu[:-1].contiguous()
+    act_q_lens = (cu[1:] - cu[:-1]).contiguous()
+    S_max = int(act_q_lens.max().item())
+
+    ori_kv = inp["ori_pa_npu"]
+    ori_bt = inp["ori_bt_npu"].to(torch.int32)
+    cmp_kv = torch.zeros((1, 1, N2, D), dtype=dtype, device=dev)
+    cmp_bt = torch.zeros((B, 1), dtype=torch.int32, device=dev)
+    cmp_idx = torch.zeros((T1, N2, DEFAULT_BLOCK_I), dtype=torch.int32, device=dev)
+    sinks = inp["sinks_npu"].to(torch.float32)
+    seqused_kv = inp["seqused_kv_npu"]
 
     func = _get_kernel(
         batch=B,
@@ -190,32 +205,47 @@ def bench_graph(func, args, iters=100):
     return (time.perf_counter() - t0) / iters * 1e3
 
 
-def bench_prep(inp, cfg, iters=100):
-    """Time everything api.sparse_attn_sharedkv does BEFORE the `func(...)` line
-    (api.py:186-366): scenario resolve, shape math, the .item() host sync, dummy
-    tensors, .to(device), metadata build, the cached _get_kernel lookup, and the
-    11 .contiguous(). This is the host PREP segment -- the lines the user's model
-    says graph-mode serving "moves out of the loop". It is HOISTABLE (run once),
-    NOT what graph capture removes. build_swa_kernel_call is the faithful replica
-    of exactly this segment, so we time it directly. Warmup first so the JIT
-    compile + kernel cache are hot (per-call is then a dict lookup, the real
-    serving cost)."""
-    for _ in range(10):
-        build_swa_kernel_call(inp, cfg)
+def bench_metadata(inp, cfg, iters=100):
+    """Time the SEPARATE metadata operator (TileLang port) alone. Out of the
+    sharedkv perf scope -- shown only so it is not silently folded into the
+    sharedkv host prep (the bug that made an earlier (A) read ~53ms for prefill)."""
+    for _ in range(3):  # fewer warmups: the prefill metadata port is ~53ms/call
+        build_metadata(inp, cfg)
     torch.npu.synchronize()
     t0 = time.perf_counter()
     for _ in range(iters):
-        build_swa_kernel_call(inp, cfg)
+        build_metadata(inp, cfg)
     torch.npu.synchronize()
     return (time.perf_counter() - t0) / iters * 1e3
 
 
-def build_full_api_call(inp, cfg):
+def bench_prep(inp, cfg, md, iters=100):
+    """Time the sharedkv host PREP segment BEFORE the `func(...)` line, with the
+    metadata operator's output PASSED IN (md, precomputed once) -- so this is the
+    genuine sharedkv prep ONLY, NOT the separate metadata op: scenario/shape math,
+    the .item() host sync, dummies, .to(device), the cached _get_kernel lookup, and
+    the 11 .contiguous(). These are the lines the user's model says graph-mode
+    serving "moves out of the loop". HOISTABLE (run once), NOT what graph capture
+    removes. build_swa_kernel_call(inp, cfg, md) is the faithful replica. Warmup
+    first so the JIT compile + kernel cache are hot (per-call is then a dict
+    lookup, the real serving cost)."""
+    for _ in range(10):
+        build_swa_kernel_call(inp, cfg, md)
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        build_swa_kernel_call(inp, cfg, md)
+    torch.npu.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3
+
+
+def build_full_api_call(inp, cfg, md):
     """Return a thunk running the REAL public api.sparse_attn_sharedkv once
-    (scenario 1 / SWA), exactly as a naive eager serving loop would: ALL the prep
-    (the bench_prep segment) PLUS func() PLUS device, every single call, with
-    metadata rebuilt per call (metadata=None). This is the full per-call host tax
-    a naive loop pays; it should be ~= prep + func_eager."""
+    (scenario 1 / SWA), as a naive eager serving loop would: ALL the sharedkv prep
+    (the bench_prep segment) PLUS func() PLUS device, every call. metadata=md is
+    PASSED IN (the separate op, precomputed once -- as perf_compare does), so this
+    is the sharedkv-only per-call cost and should be ~= prep + func_eager (it does
+    NOT include the ~53ms metadata op)."""
     q = inp["q_npu"]
     kwargs = dict(
         ori_kv=inp["ori_pa_npu"],
@@ -223,6 +253,7 @@ def build_full_api_call(inp, cfg):
         cu_seqlens_q=inp["cu_seqlens_q_npu"],
         seqused_kv=inp["seqused_kv_npu"],
         sinks=inp["sinks_npu"],
+        metadata=md,
         softmax_scale=float(cfg["softmax_scale"]),
         ori_mask_mode=cfg["ori_mask_mode"],
         ori_win_left=cfg["ori_win_left"],
@@ -273,16 +304,26 @@ def main():
     inp = stage_on_npu(build_inputs(cfg, torch.bfloat16))
 
     probe_apis()
-    func, kargs = build_swa_kernel_call(inp, cfg)
+    # Metadata = a SEPARATE op, precomputed ONCE and passed in (as serving /
+    # perf_compare do). Kept OUT of the sharedkv prep so it is not folded in.
+    md = build_metadata(inp, cfg)
+    func, kargs = build_swa_kernel_call(inp, cfg, md)
     probe_training(func, kargs)
 
     print(f"=== timing ({args_.scenario}, iters={args_.iters}) ===")
 
-    # (A) host prep BEFORE the func(...) line -- HOISTED out of the loop by a
-    #     serving loop (run once). This is the segment the user's model points at.
-    prep = bench_prep(inp, cfg, args_.iters)
+    # (M) the SEPARATE metadata operator (out of scope; shown so it is not hidden).
+    meta = bench_metadata(inp, cfg, args_.iters)
     print(
-        f"  (A) host prep BEFORE func()  per-call: {prep:.4f} ms  <- hoist removes (run once)"
+        f"  (M) metadata op (SEPARATE)   per-call: {meta:.4f} ms  <- OUT of scope, own op"
+    )
+
+    # (A) sharedkv host prep BEFORE the func(...) line, metadata PASSED IN --
+    #     HOISTED out of the loop by a serving loop (run once). The segment the
+    #     user's model points at, now WITHOUT the metadata op.
+    prep = bench_prep(inp, cfg, md, args_.iters)
+    print(
+        f"  (A) sharedkv prep before func() /call: {prep:.4f} ms  <- hoist removes (run once)"
     )
 
     # (B) func(*args) eager: the kernel-launch call itself (cython plumbing -
@@ -299,17 +340,19 @@ def main():
             f"  (C) graph replay of func()   per-call: {graph:.4f} ms  <- device only"
         )
 
-    # (D) full real api call eager: prep + func every call (naive eager serving).
-    full = bench_thunk(build_full_api_call(inp, cfg), args_.iters)
+    # (D) full real api call eager: sharedkv prep + func every call (naive eager
+    #     serving), metadata PASSED IN -- so (D) is sharedkv-only, ~= (A)+(B).
+    full = bench_thunk(build_full_api_call(inp, cfg, md), args_.iters)
     print(
-        f"  (D) FULL api eager           per-call: {full:.4f} ms  <- naive serving (~A+B)"
+        f"  (D) FULL api eager (sharedkv)/call: {full:.4f} ms  <- naive serving (~A+B)"
     )
 
     print()
+    print("  metadata op (M) is a SEPARATE op, excluded below (out of scope).")
     print("  decomposition (does (D) ~= (A)+(B)? does graph remove (B)'s host part?):")
     print(f"    naive eager serving / call        = (D)            {full:.4f} ms")
     print(
-        f"      host prep before func()         = (A)            {prep:.4f} ms   [hoist removes]"
+        f"      sharedkv prep before func()     = (A)            {prep:.4f} ms   [hoist removes]"
     )
     print(f"      func() launch + device          ~ (B)            {eager:.4f} ms")
     if graph is not None:
@@ -328,6 +371,13 @@ def main():
         )
     print()
     print("Notes:")
+    print(
+        "  * (M) the metadata op is a SEPARATE operator (its own ~53ms prefill cost),"
+    )
+    print(
+        "    timed + passed in here as serving/perf_compare do; it is NOT part of the"
+    )
+    print("    sharedkv host prep and is excluded from (A)/(D)/the decomposition.")
     print("  * The user's model = 'graph hoists the lines before func()'. That is (A),")
     print("    and (A) IS hoisted -- but by hoisting, not by capture. Graph CAPTURE")
     print("    additionally removes (B)-(C), the host plumbing INSIDE func(). Both")
