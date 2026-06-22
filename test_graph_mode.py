@@ -104,13 +104,16 @@ def build_metadata(inp, cfg):
     )
 
 
-def build_swa_kernel_call(inp, cfg, md):
+def build_swa_kernel_call(inp, cfg, md, contiguous=True):
     """Replicate api.sparse_attn_sharedkv's SWA (scenario 1) host prep and return
     (func, args), with the metadata operator's output `md` PASSED IN (precomputed
     once, exactly as a serving loop / perf_compare does -- metadata is a separate
     op, not part of the sharedkv host prep). This covers only the genuine sharedkv
     prep: shapes, the .item() for max_seq, dummies, _get_kernel lookup, the 11
-    .contiguous(). Capturing func(*args) captures only the kernel launch."""
+    .contiguous(). Capturing func(*args) captures only the kernel launch.
+
+    contiguous=False returns the RAW args (no .contiguous()), so the caller can
+    time the prep and the 11 .contiguous() separately."""
     q = inp["q_npu"]  # [T1, N1, D], TND
     dtype = q.dtype
     dev = q.device
@@ -151,19 +154,20 @@ def build_swa_kernel_call(inp, cfg, md):
         dtype="bfloat16" if dtype == torch.bfloat16 else "float16",
         core_num=DEFAULT_CORE_NUM,
     )
-    args = [
-        q.contiguous(),
-        ori_kv.contiguous(),
-        ori_bt.contiguous(),
-        cmp_kv.contiguous(),
-        cmp_bt.contiguous(),
-        cmp_idx.contiguous(),
-        q_prefix.contiguous(),
-        act_q_lens.contiguous(),
-        seqused_kv.contiguous(),
-        sinks.contiguous(),
-        md.contiguous(),
+    raw = [
+        q,
+        ori_kv,
+        ori_bt,
+        cmp_kv,
+        cmp_bt,
+        cmp_idx,
+        q_prefix,
+        act_q_lens,
+        seqused_kv,
+        sinks,
+        md,
     ]
+    args = [a.contiguous() for a in raw] if contiguous else raw
     return func, args
 
 
@@ -235,6 +239,33 @@ def bench_prep(inp, cfg, md, iters=100):
     t0 = time.perf_counter()
     for _ in range(iters):
         build_swa_kernel_call(inp, cfg, md)
+    torch.npu.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3
+
+
+def bench_prep_no_contig(inp, cfg, md, iters=100):
+    """(A1) The prep BEFORE the .contiguous(): scenario/shape math, the .item()
+    host sync, dummy allocs, .to(device), the cached _get_kernel lookup. Excludes
+    the 11 .contiguous() (build with contiguous=False)."""
+    for _ in range(10):
+        build_swa_kernel_call(inp, cfg, md, contiguous=False)
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        build_swa_kernel_call(inp, cfg, md, contiguous=False)
+    torch.npu.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3
+
+
+def bench_contiguous(inp, cfg, md, iters=100):
+    """(A2) JUST the 11 .contiguous() calls on the prepared args (built once)."""
+    _, raw = build_swa_kernel_call(inp, cfg, md, contiguous=False)
+    for _ in range(10):
+        [a.contiguous() for a in raw]
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        [a.contiguous() for a in raw]
     torch.npu.synchronize()
     return (time.perf_counter() - t0) / iters * 1e3
 
@@ -369,6 +400,35 @@ def main():
             f"    => total host tax removed         = (D)-(C)        {full - graph:.4f} ms "
             f"({100 * (1 - graph / full):.0f}% of naive)"
         )
+
+    # ---- WHICH host part dominates? Split (A) into (A1) prep-no-contiguous and
+    #      (A2) the 11 .contiguous(); (B)-(C) is the JIT-wrapper + cython forward
+    #      plumbing. Only meaningful when the host is EXPOSED -- i.e. DECODE (tiny
+    #      device). On PREFILL the func() plumbing OVERLAPS the ~1.75ms device, so
+    #      (B)-(C)~=0 there (hidden), and only the serial prep shows in wall time.
+    a1 = bench_prep_no_contig(inp, cfg, md, args_.iters)
+    a2 = bench_contiguous(inp, cfg, md, args_.iters)
+    print()
+    print("  host-part breakdown (which of the 3 dominates; read on DECODE = exposed):")
+    print(
+        f"    (A1) prep before func, NO contiguous  = {a1:.4f} ms  [shape/dummies/_get_kernel/.item]"
+    )
+    print(
+        f"    (A2) the 11 .contiguous()             = {a2:.4f} ms  [near-free if already contiguous]"
+    )
+    if graph is not None:
+        print(
+            f"    (P)  JIT wrapper + cython forward     = (B)-(C) {eager - graph:.4f} ms  [validate/alloc/ptr; ACL launch ~0.03]"
+        )
+        print(f"    (Dev) device kernel                   = (C)     {graph:.4f} ms")
+        resid = full - a1 - a2 - eager
+        print(
+            f"    (R)  real-api residual prep           = (D)-A1-A2-B {resid:.4f} ms  [api does a bit more than the replica]"
+        )
+    print(
+        "    NB: on PREFILL (P) overlaps device (~0; hidden); on DECODE it is exposed."
+    )
+
     print()
     print("Notes:")
     print(
