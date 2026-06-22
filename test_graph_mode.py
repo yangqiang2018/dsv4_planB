@@ -37,7 +37,6 @@ import torch
 import torch_npu  # noqa: F401  (registers the npu backend)
 
 from sparse_attn_sharedkv_perf_compare import SCENARIOS, build_inputs, stage_on_npu
-import api as _api
 from api import _get_kernel, DEFAULT_BLOCK_I, DEFAULT_CORE_NUM
 from metadata import sparse_attn_sharedkv_metadata as tl_metadata
 
