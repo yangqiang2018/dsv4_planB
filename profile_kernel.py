@@ -2,9 +2,17 @@
 
 The perf-compare wall-clock includes api.py host overhead (.contiguous(), a
 .cpu() sync, dict lookups), which dominates tiny workloads (decode). This script
-separates DEVICE time (npu.Event, what aclgraph deployment actually pays) from
-WALL time, and optionally prints a per-op device breakdown via torch_npu.profiler
-(no msprof CSV navigation needed).
+reports DEVICE time (npu.Event) alongside WALL time, and optionally a per-op
+device breakdown via torch_npu.profiler (no msprof CSV navigation needed).
+
+CAVEAT -- device_ms is NOT pure kernel time. npu.Event measures the span on the
+device timeline between two markers, which INCLUDES device-idle gaps when the
+device waits for the eager host to enqueue the next op. When host-bound (TileLang
+eager, whose per-call .cpu() sync stops the host running ahead), the device
+starves and device_ms inflates toward wall_ms (e.g. prefill device_ms ~2.5ms vs
+the true ~1.75ms kernel). For PURE kernel time use msprof Task Duration. Here
+device_ms is useful mainly as "device-timeline span incl. host-induced bubbles":
+ascendc's stays ~= its kernel (host keeps it fed), TileLang's does not.
 
 SHAREDKV-ONLY: the SEPARATE metadata operator (~53ms prefill for the TileLang
 port) is precomputed ONCE outside the timed region and passed in via `metadata=`,
@@ -105,7 +113,8 @@ def main() -> None:
     print(f"scenario={args.scenario} dtype={args.dtype} iters={args.iters}")
     print("  (sharedkv-only: metadata precomputed once, passed in, NOT timed)")
     print(
-        f"{'impl':10s} {'wall_ms':>10s} {'device_ms':>10s}  (device = real sharedkv kernel time)"
+        f"{'impl':10s} {'wall_ms':>10s} {'device_ms':>10s}  "
+        "(device_ms = device-timeline span incl. host-induced idle; pure kernel = msprof)"
     )
     sk_fns = {"tilelang": P.tilelang_sharedkv, "ascendc": P.ascendc_sharedkv}
     md_fns = {"tilelang": P.tilelang_metadata, "ascendc": P.ascendc_metadata}
