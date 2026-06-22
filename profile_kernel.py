@@ -86,6 +86,21 @@ def main() -> None:
     cfg = P.SCENARIOS[args.scenario]
     impls = ["tilelang", "ascendc"] if args.impl == "both" else [args.impl]
 
+    # The Ascend C path needs the custom op library registered (perf_compare does
+    # this in its own main(); importing it as a module does NOT). This registers
+    # torch.ops.custom.* AND torch_npu.npu_sparse_attn_sharedkv_metadata.
+    if "ascendc" in impls:
+        try:
+            import torch_npu  # noqa: F401
+            import custom_ops  # noqa: F401  (registers Ascend C ops)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[fatal] could not import custom_ops (Ascend C op): {exc!r}\n"
+                "  Build/install the Ascend C operator, or use --impl tilelang.",
+                file=sys.stderr,
+            )
+            return
+
     inp = P.stage_on_npu(P.build_inputs(cfg, dtype))
     print(f"scenario={args.scenario} dtype={args.dtype} iters={args.iters}")
     print("  (sharedkv-only: metadata precomputed once, passed in, NOT timed)")
