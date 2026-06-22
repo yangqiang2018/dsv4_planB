@@ -608,38 +608,15 @@ def build_sparse_attn_sharedkv(
                         valid2 = T.if_then_else(in_range2, s2 < actual_q_len[b2], False)
                         t2 = q_prefix[b2] + s2
 
-                        if valid0:
-                            # Build the causal/window mask ONLY for partial windows
-                            # (s_global < win_left): there the loaded 128 keys span
-                            # [0, 127] but only [0, s_global] are valid, so future
-                            # keys must be masked. A full window loads exactly its
-                            # valid keys, so masking is skipped (the common case).
-                            if s_global0 < ori_win_left:
-                                T.tile.createvecindex(idx_int, ori_left0)
-                                T.copy(idx_int, idx_float)
-                                T.pipe_barrier("v")
-                                T.tile.compare(
-                                    mask_ub[g % 2, :],
-                                    idx_float,
-                                    T.float32(ori_right0),
-                                    "LE",
-                                )
-                                T.pipe_barrier("v")
-                            T.wait_cross_flag(_FLAG_SCORE_READY)
-                            T.wait_flag("v", "mte2", g % 2)
-                            T.copy(
-                                ws_score[
-                                    cid,
-                                    g % 2,
-                                    vid * v_block : vid * v_block + v_block,
-                                    :,
-                                ],
-                                acc_s_ub_[
-                                    (g % 2) * v_block : (g % 2) * v_block + v_block, :
-                                ],
-                            )
-                            T.set_flag("mte2", "v", g % 2)
-
+                        # NOTE: the score-prefetch stage (formerly `if valid0`)
+                        # was MOVED to the END of this iteration (after valid2).
+                        # It waits SCORE_READY(g) from the *current* cube QK(g);
+                        # keeping it first stalled the whole vector iteration
+                        # (incl. the ready softmax(g-1)/output(g-2)) behind the
+                        # cross-core wait. Doing the ready work first and the
+                        # prefetch last matches Ascend C's PreloadPipeline
+                        # (process past queries; load the current one last) and
+                        # removes the front-of-iteration bubble.
                         if valid1:
                             pv1 = (g - 1) % 2
                             # Sink-seeded online softmax (single tile): seed running
@@ -786,6 +763,40 @@ def build_sparse_attn_sharedkv(
                                 lse_ub,
                                 LSE_out[t2, vid * v_block : vid * v_block + v_block],
                             )
+
+                        # --- Score prefetch for the NEXT query (moved here from
+                        # the front of the iteration). Waits SCORE_READY(g) from
+                        # the current cube QK(g); by now the vector has already
+                        # done softmax(g-1)/output(g-2), so cube QK(g) is done
+                        # and this no longer stalls. Loads score(g) into
+                        # acc_s_ub_[g%2] for next iteration's softmax, and builds
+                        # the partial-window mask into mask_ub[g%2]. ---
+                        if valid0:
+                            if s_global0 < ori_win_left:
+                                T.tile.createvecindex(idx_int, ori_left0)
+                                T.copy(idx_int, idx_float)
+                                T.pipe_barrier("v")
+                                T.tile.compare(
+                                    mask_ub[g % 2, :],
+                                    idx_float,
+                                    T.float32(ori_right0),
+                                    "LE",
+                                )
+                                T.pipe_barrier("v")
+                            T.wait_cross_flag(_FLAG_SCORE_READY)
+                            T.wait_flag("v", "mte2", g % 2)
+                            T.copy(
+                                ws_score[
+                                    cid,
+                                    g % 2,
+                                    vid * v_block : vid * v_block + v_block,
+                                    :,
+                                ],
+                                acc_s_ub_[
+                                    (g % 2) * v_block : (g % 2) * v_block + v_block, :
+                                ],
+                            )
+                            T.set_flag("mte2", "v", g % 2)
                     T.wait_flag("v", "mte2", 0)
                     T.wait_flag("v", "mte2", 1)
 
