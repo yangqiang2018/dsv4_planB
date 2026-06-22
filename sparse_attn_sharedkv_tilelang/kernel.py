@@ -244,13 +244,15 @@ def build_sparse_attn_sharedkv(
                 kv_hi = T.alloc_L1([2, BI_half, D], dtype)
                 p_lo = T.alloc_L1([H_per_block, BI_half], dtype)
                 p_hi = T.alloc_L1([H_per_block, BI_half], dtype)
-                # CFA (scenario>=2): one reused cmp-KV L1 half (lo then hi,
-                # serially), 64KB placed in the L1 headroom after the ori
-                # buffers. cmp QK reuses the ori acc_s_a/acc_s_b L0C tiles
-                # (free after the ori fixpipe). Faithful to swa_block_cube.h
-                # ComputeMm1 isOri=false (cmp_KV via cmp_block_table).
-                if is_cfa:
-                    cmp_kv_l1 = T.alloc_L1([BI_half, D], dtype)
+                # CFA: one reused cmp-KV L1 half (lo then hi, serially), 64KB in
+                # the L1 headroom after the ori buffers; cmp QK reuses the ori
+                # acc_s_a/acc_s_b L0C tiles (free after the ori fixpipe). Faithful
+                # to swa_block_cube.h ComputeMm1 isOri=false (cmp_KV via
+                # cmp_block_table). Declared UNCONDITIONALLY (like Ascend C always
+                # declares the cmp buffers) -- TVMScript scopes names to the `if`
+                # frame they are defined in, so an `if is_cfa:` alloc would be
+                # invisible later; SWA never touches it (NI_cmp==0) -> DCE'd.
+                cmp_kv_l1 = T.alloc_L1([BI_half, D], dtype)
                 # Two score accumulators so the two QK halves overlap with their
                 # L0C->GM fixpipe copies; one output accumulator for P@V.
                 acc_s_a = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
@@ -289,88 +291,49 @@ def build_sparse_attn_sharedkv(
                 recip = T.alloc_ub([ub_len], accum_dtype)
                 recip_brd8 = T.alloc_ub([MERGE_HEADS, 8], accum_dtype)
 
-                # Address map. CFA adds cmp_kv_l1 (64KB in the L1 headroom after
-                # p_hi). Built as two compile-time branches (a `**`-unpacked dict
-                # literal is not accepted by the TVMScript parser, and assigning a
-                # dict to a local is intercepted as a LetStmt) so the SWA branch is
-                # byte-identical to the original.
-                if is_cfa:
-                    T.annotate_address(
-                        {
-                            q_l1: 0,
-                            kv_lo: 128 * KB,
-                            kv_hi: 256 * KB,
-                            p_lo: 384 * KB,
-                            p_hi: 392 * KB,
-                            cmp_kv_l1: 400 * KB,
-                            acc_s_a: 0,
-                            acc_s_b: 64 * KB,
-                            acc_o_l0c: l0c_addr["acc_o_l0c"],
-                            acc_o_work: ub_addr["acc_o"],
-                            acc_o_work2: ub_addr["acc_o"] + 32 * KB,
-                            acc_s_ub: ub_addr["acc_s_ub"],
-                            acc_s_ub_: ub_addr["acc_s_ub_"],
-                            acc_s_half: ub_addr["acc_s_half"],
-                            m_i: ub_addr["m_i"],
-                            m_i_prev: ub_addr["m_i_prev"],
-                            sumexp: ub_addr["sumexp"],
-                            sumexp_i_ub: ub_addr["sumexp_i_ub"],
-                            lse_ub: ub_addr["lse_ub"],
-                            sinks_ub: ub_addr["sinks_ub"],
-                            idx_int: ub_addr["idx_int"],
-                            idx_float: ub_addr["idx_float"],
-                            alpha: ub_addr["alpha"],
-                            mask_ub: ub_addr["mask_ub"],
-                            mask_sel: ub_addr["mask_sel"],
-                            acc_o_half: ub_addr["acc_o_half"],
-                            softmax_tmp: ub_addr["kv_ub_multi"],
-                            alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
-                            sumexp_sv: ub_addr["mask_sel"] + 32,
-                            m_i_sv: ub_addr["mask_sel"] + 32 + 256,
-                            sumexp_rt: ub_addr["mask_sel"] + 32 + 512,
-                            m_i_rt: ub_addr["mask_sel"] + 32 + 640,
-                            recip: ub_addr["mask_sel"] + 32 + 768,
-                            recip_brd8: ub_addr["mask_sel"] + 32 + 896,
-                        }
-                    )
-                else:
-                    T.annotate_address(
-                        {
-                            q_l1: 0,
-                            kv_lo: 128 * KB,
-                            kv_hi: 256 * KB,
-                            p_lo: 384 * KB,
-                            p_hi: 392 * KB,
-                            acc_s_a: 0,
-                            acc_s_b: 64 * KB,
-                            acc_o_l0c: l0c_addr["acc_o_l0c"],
-                            acc_o_work: ub_addr["acc_o"],
-                            acc_o_work2: ub_addr["acc_o"] + 32 * KB,
-                            acc_s_ub: ub_addr["acc_s_ub"],
-                            acc_s_ub_: ub_addr["acc_s_ub_"],
-                            acc_s_half: ub_addr["acc_s_half"],
-                            m_i: ub_addr["m_i"],
-                            m_i_prev: ub_addr["m_i_prev"],
-                            sumexp: ub_addr["sumexp"],
-                            sumexp_i_ub: ub_addr["sumexp_i_ub"],
-                            lse_ub: ub_addr["lse_ub"],
-                            sinks_ub: ub_addr["sinks_ub"],
-                            idx_int: ub_addr["idx_int"],
-                            idx_float: ub_addr["idx_float"],
-                            alpha: ub_addr["alpha"],
-                            mask_ub: ub_addr["mask_ub"],
-                            mask_sel: ub_addr["mask_sel"],
-                            acc_o_half: ub_addr["acc_o_half"],
-                            softmax_tmp: ub_addr["kv_ub_multi"],
-                            alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
-                            sumexp_sv: ub_addr["mask_sel"] + 32,
-                            m_i_sv: ub_addr["mask_sel"] + 32 + 256,
-                            sumexp_rt: ub_addr["mask_sel"] + 32 + 512,
-                            m_i_rt: ub_addr["mask_sel"] + 32 + 640,
-                            recip: ub_addr["mask_sel"] + 32 + 768,
-                            recip_brd8: ub_addr["mask_sel"] + 32 + 896,
-                        }
-                    )
+                # Address map. cmp_kv_l1 (64KB in the L1 headroom after p_hi) is
+                # always included; for SWA it is unused and DCE'd. A single literal
+                # passed directly to annotate_address -- a dict assigned to a local
+                # is intercepted as a LetStmt, a `**`-unpack is rejected by the
+                # parser, and an `if is_cfa:` branch scopes any names to its frame.
+                T.annotate_address(
+                    {
+                        q_l1: 0,
+                        kv_lo: 128 * KB,
+                        kv_hi: 256 * KB,
+                        p_lo: 384 * KB,
+                        p_hi: 392 * KB,
+                        cmp_kv_l1: 400 * KB,
+                        acc_s_a: 0,
+                        acc_s_b: 64 * KB,
+                        acc_o_l0c: l0c_addr["acc_o_l0c"],
+                        acc_o_work: ub_addr["acc_o"],
+                        acc_o_work2: ub_addr["acc_o"] + 32 * KB,
+                        acc_s_ub: ub_addr["acc_s_ub"],
+                        acc_s_ub_: ub_addr["acc_s_ub_"],
+                        acc_s_half: ub_addr["acc_s_half"],
+                        m_i: ub_addr["m_i"],
+                        m_i_prev: ub_addr["m_i_prev"],
+                        sumexp: ub_addr["sumexp"],
+                        sumexp_i_ub: ub_addr["sumexp_i_ub"],
+                        lse_ub: ub_addr["lse_ub"],
+                        sinks_ub: ub_addr["sinks_ub"],
+                        idx_int: ub_addr["idx_int"],
+                        idx_float: ub_addr["idx_float"],
+                        alpha: ub_addr["alpha"],
+                        mask_ub: ub_addr["mask_ub"],
+                        mask_sel: ub_addr["mask_sel"],
+                        acc_o_half: ub_addr["acc_o_half"],
+                        softmax_tmp: ub_addr["kv_ub_multi"],
+                        alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
+                        sumexp_sv: ub_addr["mask_sel"] + 32,
+                        m_i_sv: ub_addr["mask_sel"] + 32 + 256,
+                        sumexp_rt: ub_addr["mask_sel"] + 32 + 512,
+                        m_i_rt: ub_addr["mask_sel"] + 32 + 640,
+                        recip: ub_addr["mask_sel"] + 32 + 768,
+                        recip_brd8: ub_addr["mask_sel"] + 32 + 896,
+                    }
+                )
 
                 # ---- This core's metadata-assigned work range. ----
                 # Materialize the loop-invariant scalars ONCE (alloc_var): as plain
@@ -424,9 +387,11 @@ def build_sparse_attn_sharedkv(
                     n_hi = T.alloc_var(indices_dtype, init=0)
                     T.set_flag("fix", "m", 0)
                     T.set_flag("fix", "m", 1)
-                    if is_cfa:
-                        # Seed the cmp-KV L1 slot as free (M->MTE2, id 6) so the
-                        # first cmp gather's wait passes.
+                    # Seed the cmp-KV L1 slot as free (M->MTE2, id 6) so the first
+                    # cmp gather's wait passes. Gated by a range() (compile-time
+                    # unroll: emitted only when NI_cmp>0) rather than `if is_cfa:`,
+                    # which TVMScript turns into a runtime/​scoped IfFrame.
+                    for _ in range(1 if NI_cmp > 0 else 0):
                         T.set_flag("m", "mte2", 6)
                     for g in T.serial(num_local + 2):
                         # pid0 = current task (QK), pid1 = task-1 (PV).
@@ -611,7 +576,10 @@ def build_sparse_attn_sharedkv(
                             T.set_flag("fix", "m", 1)
                             T.set_cross_flag("FIX", _FLAG_SCORE_READY)
 
-                            if is_cfa:
+                            # Compile-time gate via range() (NI_cmp==0 -> nothing
+                            # emitted for SWA), NOT `if is_cfa:` which TVMScript
+                            # turns into a runtime/​scoped IfFrame.
+                            for _ in range(1 if NI_cmp > 0 else 0):
                                 # ---- CFA dense compressed QK: Q @ cmp_kv^T over
                                 # NI_cmp dense tiles [t*BI, t*BI+BI). Mirrors the
                                 # ori paged gather but from cmp_KV via
