@@ -231,15 +231,24 @@ def sparse_attn_sharedkv(
     # inputs are reshaped (a free view of the same contiguous memory).
     if layout_q == "TND":
         assert cu_seqlens_q is not None, "cu_seqlens_q is required for TND"
-        cu = cu_seqlens_q.to(torch.int32).cpu()
+        # Keep the prefix/length derivation on-device: q_prefix and act_q_lens
+        # are pure slices/diffs of cu_seqlens_q (no host round-trip), and only
+        # the scalar S_max (a compile-time kernel param) needs a device->host
+        # read. The old path did .cpu()+.tolist()+two H2D torch.tensor copies
+        # per call -- avoid those launch-side round-trips.
+        cu = (
+            cu_seqlens_q
+            if cu_seqlens_q.dtype == torch.int32
+            else cu_seqlens_q.to(torch.int32)
+        )
         B = cu.numel() - 1
-        seq_lens = (cu[1:] - cu[:-1]).tolist()
-        S_max = max(seq_lens) if seq_lens else 0
+        lens_dev = cu[1:] - cu[:-1]
+        S_max = int(lens_dev.max().item()) if B > 0 else 0
         T1, N1, D = q.shape
         total_tokens = T1
         q_flat = q
-        q_prefix = cu[:-1].to(q.device)
-        act_q_lens = torch.tensor(seq_lens, dtype=torch.int32, device=q.device)
+        q_prefix = cu[:-1]
+        act_q_lens = lens_dev
         if scenario == 3:
             cmp_indices_flat = cmp_sparse_indices.to(torch.int32).to(q.device)
         else:
