@@ -163,13 +163,26 @@ def build_sparse_attn_sharedkv(
         "acc_o_half": 64 * KB,
     }
 
-    if scenario != 1:
+    if scenario == 3:
         raise NotImplementedError(
-            "Clean-room reimplementation in progress: only scenario 1 (SWA) is "
-            f"available yet; scenario {scenario} (CFA/SCFA) is coming next."
+            "Clean-room reimplementation in progress: scenarios 1 (SWA) and 2 "
+            "(CFA) are available; scenario 3 (SCFA) is coming next."
         )
 
-    @tilelang.jit(out_idx=[11, 12], workspace_idx=[13, 14, 15, 16, 17])
+    # CFA (scenario 2) = SWA ori pass + a DENSE compressed pass over cmp_kv,
+    # merged by ONE running flash softmax (faithful to swa_*.h templateMode ==
+    # CFA_TEMPLATE; CFA is compiled from the SAME SparseAttnSharedkvSwa class,
+    # NOT scfa_*.h). Per query: 1 ori tile (sliding window) + NI_cmp dense cmp
+    # tiles. cmp tile t covers compressed keys [t*BI, t*BI+BI); the per-query
+    # causal threshold (valid compressed-key count) is (s_global + 1)//cmp_ratio
+    # = floor((act_kv - act_q + s + 1)/cmp_ratio), matching cmpMaskMode=3. The
+    # over-read tail (>= threshold) is masked. NI_cmp = K/BI is compile-time
+    # (=1 for the cfa test: cmp_ratio=128, seqused~8192 -> K=128). All CFA codegen
+    # below is gated `if scenario >= 2:` so scenario 1 stays byte-identical.
+    is_cfa = scenario >= 2
+    NI_cmp_eff = max(NI_cmp, 1)  # workspace tile dim (>=1 so SWA allocs a dummy)
+
+    @tilelang.jit(out_idx=[11, 12], workspace_idx=[13, 14, 15, 16, 17, 18])
     def _make():
         # =================================================================
         # SWA (scenario 1): sliding-window attention only. Each query
@@ -202,6 +215,11 @@ def build_sparse_attn_sharedkv(
             ws_p: T.Tensor([core_num, 2, H_per_block, BI], dtype),
             ws_o: T.Tensor([core_num, 2, H_per_block, D], accum_dtype),
             ws_acc_o: T.Tensor([core_num, 2, H_per_block, D], accum_dtype),
+            # CFA dense compressed scores (scenario>=2); SWA allocates a [.,.,1,.,.]
+            # dummy and never reads it (no codegen -> SWA byte-identical).
+            ws_score_cmp: T.Tensor(
+                [core_num, 2, NI_cmp_eff, H_per_block, BI], accum_dtype
+            ),
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 (cube-side) buffers, double-buffered over pid parity. ----
@@ -210,6 +228,13 @@ def build_sparse_attn_sharedkv(
                 kv_hi = T.alloc_L1([2, BI_half, D], dtype)
                 p_lo = T.alloc_L1([H_per_block, BI_half], dtype)
                 p_hi = T.alloc_L1([H_per_block, BI_half], dtype)
+                # CFA (scenario>=2): one reused cmp-KV L1 half (lo then hi,
+                # serially), 64KB placed in the L1 headroom after the ori
+                # buffers. cmp QK reuses the ori acc_s_a/acc_s_b L0C tiles
+                # (free after the ori fixpipe). Faithful to swa_block_cube.h
+                # ComputeMm1 isOri=false (cmp_KV via cmp_block_table).
+                if is_cfa:
+                    cmp_kv_l1 = T.alloc_L1([BI_half, D], dtype)
                 # Two score accumulators so the two QK halves overlap with their
                 # L0C->GM fixpipe copies; one output accumulator for P@V.
                 acc_s_a = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
@@ -248,43 +273,45 @@ def build_sparse_attn_sharedkv(
                 recip = T.alloc_ub([ub_len], accum_dtype)
                 recip_brd8 = T.alloc_ub([MERGE_HEADS, 8], accum_dtype)
 
-                T.annotate_address(
-                    {
-                        q_l1: 0,
-                        kv_lo: 128 * KB,
-                        kv_hi: 256 * KB,
-                        p_lo: 384 * KB,
-                        p_hi: 392 * KB,
-                        acc_s_a: 0,
-                        acc_s_b: 64 * KB,
-                        acc_o_l0c: l0c_addr["acc_o_l0c"],
-                        acc_o_work: ub_addr["acc_o"],
-                        acc_o_work2: ub_addr["acc_o"] + 32 * KB,
-                        acc_s_ub: ub_addr["acc_s_ub"],
-                        acc_s_ub_: ub_addr["acc_s_ub_"],
-                        acc_s_half: ub_addr["acc_s_half"],
-                        m_i: ub_addr["m_i"],
-                        m_i_prev: ub_addr["m_i_prev"],
-                        sumexp: ub_addr["sumexp"],
-                        sumexp_i_ub: ub_addr["sumexp_i_ub"],
-                        lse_ub: ub_addr["lse_ub"],
-                        sinks_ub: ub_addr["sinks_ub"],
-                        idx_int: ub_addr["idx_int"],
-                        idx_float: ub_addr["idx_float"],
-                        alpha: ub_addr["alpha"],
-                        mask_ub: ub_addr["mask_ub"],
-                        mask_sel: ub_addr["mask_sel"],
-                        acc_o_half: ub_addr["acc_o_half"],
-                        softmax_tmp: ub_addr["kv_ub_multi"],
-                        alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
-                        sumexp_sv: ub_addr["mask_sel"] + 32,
-                        m_i_sv: ub_addr["mask_sel"] + 32 + 256,
-                        sumexp_rt: ub_addr["mask_sel"] + 32 + 512,
-                        m_i_rt: ub_addr["mask_sel"] + 32 + 640,
-                        recip: ub_addr["mask_sel"] + 32 + 768,
-                        recip_brd8: ub_addr["mask_sel"] + 32 + 896,
-                    }
-                )
+                _l1ub_addr = {
+                    q_l1: 0,
+                    kv_lo: 128 * KB,
+                    kv_hi: 256 * KB,
+                    p_lo: 384 * KB,
+                    p_hi: 392 * KB,
+                    acc_s_a: 0,
+                    acc_s_b: 64 * KB,
+                    acc_o_l0c: l0c_addr["acc_o_l0c"],
+                    acc_o_work: ub_addr["acc_o"],
+                    acc_o_work2: ub_addr["acc_o"] + 32 * KB,
+                    acc_s_ub: ub_addr["acc_s_ub"],
+                    acc_s_ub_: ub_addr["acc_s_ub_"],
+                    acc_s_half: ub_addr["acc_s_half"],
+                    m_i: ub_addr["m_i"],
+                    m_i_prev: ub_addr["m_i_prev"],
+                    sumexp: ub_addr["sumexp"],
+                    sumexp_i_ub: ub_addr["sumexp_i_ub"],
+                    lse_ub: ub_addr["lse_ub"],
+                    sinks_ub: ub_addr["sinks_ub"],
+                    idx_int: ub_addr["idx_int"],
+                    idx_float: ub_addr["idx_float"],
+                    alpha: ub_addr["alpha"],
+                    mask_ub: ub_addr["mask_ub"],
+                    mask_sel: ub_addr["mask_sel"],
+                    acc_o_half: ub_addr["acc_o_half"],
+                    softmax_tmp: ub_addr["kv_ub_multi"],
+                    alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
+                    sumexp_sv: ub_addr["mask_sel"] + 32,
+                    m_i_sv: ub_addr["mask_sel"] + 32 + 256,
+                    sumexp_rt: ub_addr["mask_sel"] + 32 + 512,
+                    m_i_rt: ub_addr["mask_sel"] + 32 + 640,
+                    recip: ub_addr["mask_sel"] + 32 + 768,
+                    recip_brd8: ub_addr["mask_sel"] + 32 + 896,
+                }
+                if is_cfa:
+                    # 64KB cmp-KV half in the L1 headroom after p_hi (400KB).
+                    _l1ub_addr[cmp_kv_l1] = 400 * KB
+                T.annotate_address(_l1ub_addr)
 
                 # ---- This core's metadata-assigned work range. ----
                 # Materialize the loop-invariant scalars ONCE (alloc_var): as plain
@@ -338,6 +365,10 @@ def build_sparse_attn_sharedkv(
                     n_hi = T.alloc_var(indices_dtype, init=0)
                     T.set_flag("fix", "m", 0)
                     T.set_flag("fix", "m", 1)
+                    if is_cfa:
+                        # Seed the cmp-KV L1 slot as free (M->MTE2, id 6) so the
+                        # first cmp gather's wait passes.
+                        T.set_flag("m", "mte2", 6)
                     for g in T.serial(num_local + 2):
                         # pid0 = current task (QK), pid1 = task-1 (PV).
                         pid0 = linear_start + g
@@ -520,6 +551,128 @@ def build_sparse_attn_sharedkv(
                             )
                             T.set_flag("fix", "m", 1)
                             T.set_cross_flag("FIX", _FLAG_SCORE_READY)
+
+                            if is_cfa:
+                                # ---- CFA dense compressed QK: Q @ cmp_kv^T over
+                                # NI_cmp tiles, each covering compressed keys
+                                # [t*BI, t*BI+BI) of this batch's cmp cache
+                                # (dense [0,K); relativeS2Idx=t, s2StartPoint=0).
+                                # Mirrors the ori paged gather but from cmp_KV via
+                                # cmp_block_table/cmp_block_size, reusing acc_s_a/
+                                # acc_s_b (free after the ori fixpipe) and one
+                                # reused cmp KV L1 half. Writes ws_score_cmp; the
+                                # vector merge + cmp PV come next. cmp_block_size /
+                                # tile offsets are compile-time (Python) -> the
+                                # segment split is a compile-time branch. ----
+                                for tcmp in range(NI_cmp):
+                                    cbase = tcmp * BI
+                                    cbidx_lo = cbase // cmp_block_size
+                                    crowc_lo = cbase % cmp_block_size
+                                    cn_lo = cmp_block_size - crowc_lo
+                                    T.wait_flag("m", "mte2", 6)
+                                    if cn_lo >= BI_half:
+                                        T.copy(
+                                            cmp_KV[
+                                                cmp_block_table[b0, cbidx_lo],
+                                                crowc_lo : crowc_lo + BI_half,
+                                                0,
+                                                :,
+                                            ],
+                                            cmp_kv_l1[0:BI_half, :],
+                                        )
+                                    else:
+                                        T.copy(
+                                            cmp_KV[
+                                                cmp_block_table[b0, cbidx_lo],
+                                                crowc_lo : crowc_lo + cn_lo,
+                                                0,
+                                                :,
+                                            ],
+                                            cmp_kv_l1[0:cn_lo, :],
+                                        )
+                                        T.copy(
+                                            cmp_KV[
+                                                cmp_block_table[b0, cbidx_lo + 1],
+                                                0 : BI_half - cn_lo,
+                                                0,
+                                                :,
+                                            ],
+                                            cmp_kv_l1[cn_lo:BI_half, :],
+                                        )
+                                    T.set_flag("mte2", "m", 6)
+                                    T.wait_flag("mte2", "m", 6)
+                                    T.wait_flag("fix", "m", 0)
+                                    T.gemm_v0(
+                                        q_l1[pa, :, :],
+                                        cmp_kv_l1,
+                                        acc_s_a,
+                                        transpose_B=True,
+                                        init=True,
+                                        unit_flag=True,
+                                    )
+                                    T.fixpipe(
+                                        acc_s_a,
+                                        ws_score_cmp[
+                                            cid, pa, tcmp, 0:H_per_block, 0:BI_half
+                                        ],
+                                        unit_flag=0b11,
+                                    )
+                                    T.set_flag("fix", "m", 0)
+                                    T.set_flag("m", "mte2", 6)
+                                    chi = cbase + BI_half
+                                    cbidx_hi = chi // cmp_block_size
+                                    crowc_hi = chi % cmp_block_size
+                                    cn_hi = cmp_block_size - crowc_hi
+                                    T.wait_flag("m", "mte2", 6)
+                                    if cn_hi >= BI_half:
+                                        T.copy(
+                                            cmp_KV[
+                                                cmp_block_table[b0, cbidx_hi],
+                                                crowc_hi : crowc_hi + BI_half,
+                                                0,
+                                                :,
+                                            ],
+                                            cmp_kv_l1[0:BI_half, :],
+                                        )
+                                    else:
+                                        T.copy(
+                                            cmp_KV[
+                                                cmp_block_table[b0, cbidx_hi],
+                                                crowc_hi : crowc_hi + cn_hi,
+                                                0,
+                                                :,
+                                            ],
+                                            cmp_kv_l1[0:cn_hi, :],
+                                        )
+                                        T.copy(
+                                            cmp_KV[
+                                                cmp_block_table[b0, cbidx_hi + 1],
+                                                0 : BI_half - cn_hi,
+                                                0,
+                                                :,
+                                            ],
+                                            cmp_kv_l1[cn_hi:BI_half, :],
+                                        )
+                                    T.set_flag("mte2", "m", 6)
+                                    T.wait_flag("mte2", "m", 6)
+                                    T.wait_flag("fix", "m", 1)
+                                    T.gemm_v0(
+                                        q_l1[pa, :, :],
+                                        cmp_kv_l1,
+                                        acc_s_b,
+                                        transpose_B=True,
+                                        init=True,
+                                        unit_flag=True,
+                                    )
+                                    T.fixpipe(
+                                        acc_s_b,
+                                        ws_score_cmp[
+                                            cid, pa, tcmp, 0:H_per_block, BI_half:BI
+                                        ],
+                                        unit_flag=0b11,
+                                    )
+                                    T.set_flag("fix", "m", 1)
+                                    T.set_flag("m", "mte2", 6)
 
                         if valid1:
                             pb = (g - 1) % 2
