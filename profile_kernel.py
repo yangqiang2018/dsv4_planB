@@ -6,6 +6,13 @@ separates DEVICE time (npu.Event, what aclgraph deployment actually pays) from
 WALL time, and optionally prints a per-op device breakdown via torch_npu.profiler
 (no msprof CSV navigation needed).
 
+SHAREDKV-ONLY: the SEPARATE metadata operator (~53ms prefill for the TileLang
+port) is precomputed ONCE outside the timed region and passed in via `metadata=`,
+exactly as a serving loop / perf_compare do. The timed/profiled region runs ONLY
+the sharedkv op, so wall_ms / device_ms / the per-op table are sharedkv kernels
+alone -- NOT metadata+sharedkv combined. (An earlier version timed the whole
+metadata+sharedkv `once()`, folding the ~53ms metadata into the reported number.)
+
 Usage (on the NPU container)::
 
     cd /sdb/yq/dsv4_planB
@@ -30,16 +37,17 @@ import torch  # noqa: E402
 import sparse_attn_sharedkv_perf_compare as P  # noqa: E402
 
 
-def _time(once, inp, cfg, iters, warmup):
+def _time(sharedkv, inp, cfg, md, iters, warmup):
+    """Time ONLY the sharedkv op (metadata `md` precomputed, passed in)."""
     for _ in range(warmup):
-        once(inp, cfg)
+        sharedkv(inp, cfg, md)
     torch.npu.synchronize()
     start = torch.npu.Event(enable_timing=True)
     end = torch.npu.Event(enable_timing=True)
     t0 = perf_counter()
     start.record()
     for _ in range(iters):
-        once(inp, cfg)
+        sharedkv(inp, cfg, md)
     end.record()
     torch.npu.synchronize()
     wall_ms = (perf_counter() - t0) / iters * 1e3
@@ -47,7 +55,8 @@ def _time(once, inp, cfg, iters, warmup):
     return wall_ms, dev_ms
 
 
-def _table(once, inp, cfg, n=10):
+def _table(sharedkv, inp, cfg, md, n=10):
+    """Per-op device table for the sharedkv op only (metadata not run here)."""
     try:
         import torch_npu  # noqa: F401
 
@@ -56,7 +65,7 @@ def _table(once, inp, cfg, n=10):
         )
         with prof:
             for _ in range(n):
-                once(inp, cfg)
+                sharedkv(inp, cfg, md)
             torch.npu.synchronize()
         print(prof.key_averages().table(sort_by="self_npu_time_total", row_limit=25))
     except Exception as e:  # noqa: BLE001
@@ -79,18 +88,24 @@ def main() -> None:
 
     inp = P.stage_on_npu(P.build_inputs(cfg, dtype))
     print(f"scenario={args.scenario} dtype={args.dtype} iters={args.iters}")
+    print("  (sharedkv-only: metadata precomputed once, passed in, NOT timed)")
     print(
-        f"{'impl':10s} {'wall_ms':>10s} {'device_ms':>10s}  (device = real kernel time)"
+        f"{'impl':10s} {'wall_ms':>10s} {'device_ms':>10s}  (device = real sharedkv kernel time)"
     )
-    fns = {"tilelang": P.tilelang_once, "ascendc": P.ascendc_once}
+    sk_fns = {"tilelang": P.tilelang_sharedkv, "ascendc": P.ascendc_sharedkv}
+    md_fns = {"tilelang": P.tilelang_metadata, "ascendc": P.ascendc_metadata}
     for impl in impls:
-        wall, dev = _time(fns[impl], inp, cfg, args.iters, args.warmup)
+        md = md_fns[impl](inp, cfg)  # the SEPARATE metadata op, built ONCE
+        torch.npu.synchronize()
+        wall, dev = _time(sk_fns[impl], inp, cfg, md, args.iters, args.warmup)
         print(f"{impl:10s} {wall:10.4f} {dev:10.4f}")
 
     if args.table:
         for impl in impls:
-            print(f"\n=== per-op device breakdown: {impl} ===")
-            _table(fns[impl], inp, cfg)
+            print(f"\n=== per-op device breakdown: {impl} (sharedkv only) ===")
+            md = md_fns[impl](inp, cfg)
+            torch.npu.synchronize()
+            _table(sk_fns[impl], inp, cfg, md)
 
 
 if __name__ == "__main__":

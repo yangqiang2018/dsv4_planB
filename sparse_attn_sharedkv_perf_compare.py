@@ -381,9 +381,10 @@ def _sync():
 
 
 # ---- One metadata + sharedkv iteration, per implementation. ----
-def tilelang_once(inp, cfg):
-    """Run TileLang metadata then sharedkv; return (md_ms, sk_ms)."""
-    from api import sparse_attn_sharedkv as tl_sharedkv
+def tilelang_metadata(inp, cfg):
+    """Build the TileLang metadata tensor -- the SEPARATE companion op. Factored
+    out so profile_kernel can precompute it ONCE and time sharedkv alone (the
+    metadata port is ~53ms prefill and must not be folded into sharedkv timing)."""
     from metadata import sparse_attn_sharedkv_metadata as tl_metadata
 
     scenario = cfg["scenario"]
@@ -415,12 +416,16 @@ def tilelang_once(inp, cfg):
         md_kwargs["cmp_mask_mode"] = cfg["cmp_mask_mode"]
     if scenario == 3:
         md_kwargs["cmp_topk"] = K
+    return tl_metadata(**md_kwargs)
 
-    _sync()
-    t0 = perf_counter()
-    md = tl_metadata(**md_kwargs)
-    _sync()
-    t1 = perf_counter()
+
+def tilelang_sharedkv(inp, cfg, md):
+    """Run ONLY the TileLang sharedkv op with a precomputed metadata `md`."""
+    from api import sparse_attn_sharedkv as tl_sharedkv
+
+    scenario = cfg["scenario"]
+    K = cfg.get("K", 0)
+    layout_q = cfg["layout_q"]
     with torch.device("npu"):
         tl_sharedkv(
             inp["q_npu"],
@@ -444,13 +449,26 @@ def tilelang_once(inp, cfg):
             return_softmax_lse=True,
             topk_cmp=K,
         )
+
+
+def tilelang_once(inp, cfg):
+    """Run TileLang metadata then sharedkv; return (md_ms, sk_ms). Behavior is
+    identical to the pre-split version: metadata is built+timed (t0->t1) then
+    sharedkv built+timed (t1->t2), each bracketed by _sync()."""
+    _sync()
+    t0 = perf_counter()
+    md = tilelang_metadata(inp, cfg)
+    _sync()
+    t1 = perf_counter()
+    tilelang_sharedkv(inp, cfg, md)
     _sync()
     t2 = perf_counter()
     return (t1 - t0) * 1e3, (t2 - t1) * 1e3
 
 
-def ascendc_once(inp, cfg):
-    """Run Ascend C metadata then sharedkv; return (md_ms, sk_ms)."""
+def ascendc_metadata(inp, cfg):
+    """Build the Ascend C metadata tensor -- the SEPARATE companion op. Factored
+    out so profile_kernel can precompute it ONCE and time sharedkv alone."""
     import torch_npu
 
     scenario = cfg["scenario"]
@@ -489,14 +507,16 @@ def ascendc_once(inp, cfg):
         md_kwargs["cmp_topk"] = K
         md_kwargs["cmp_ratio"] = cfg["cmp_ratio"]
         md_kwargs["cmp_mask_mode"] = cfg["cmp_mask_mode"]
+    return torch_npu.npu_sparse_attn_sharedkv_metadata(**md_kwargs)
 
+
+def ascendc_sharedkv(inp, cfg, md):
+    """Run ONLY the Ascend C sharedkv op with a precomputed metadata `md`."""
+    import torch_npu  # noqa: F401  (registers torch.ops.custom)
+
+    scenario = cfg["scenario"]
+    layout_q = cfg["layout_q"]
     cu_q = inp["cu_seqlens_q_npu"] if layout_q == "TND" else None
-
-    _sync()
-    t0 = perf_counter()
-    md = torch_npu.npu_sparse_attn_sharedkv_metadata(**md_kwargs)
-    _sync()
-    t1 = perf_counter()
     if scenario == 1:  # SWA
         torch.ops.custom.npu_sparse_attn_sharedkv(
             inp["q_npu"],
@@ -557,6 +577,17 @@ def ascendc_once(inp, cfg):
             layout_q=layout_q,
             layout_kv="PA_ND",
         )
+
+
+def ascendc_once(inp, cfg):
+    """Run Ascend C metadata then sharedkv; return (md_ms, sk_ms). Behavior is
+    identical to the pre-split version."""
+    _sync()
+    t0 = perf_counter()
+    md = ascendc_metadata(inp, cfg)
+    _sync()
+    t1 = perf_counter()
+    ascendc_sharedkv(inp, cfg, md)
     _sync()
     t2 = perf_counter()
     return (t1 - t0) * 1e3, (t2 - t1) * 1e3
