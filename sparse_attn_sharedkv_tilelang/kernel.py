@@ -273,45 +273,45 @@ def build_sparse_attn_sharedkv(
                 recip = T.alloc_ub([ub_len], accum_dtype)
                 recip_brd8 = T.alloc_ub([MERGE_HEADS, 8], accum_dtype)
 
-                _l1ub_addr = {
-                    q_l1: 0,
-                    kv_lo: 128 * KB,
-                    kv_hi: 256 * KB,
-                    p_lo: 384 * KB,
-                    p_hi: 392 * KB,
-                    acc_s_a: 0,
-                    acc_s_b: 64 * KB,
-                    acc_o_l0c: l0c_addr["acc_o_l0c"],
-                    acc_o_work: ub_addr["acc_o"],
-                    acc_o_work2: ub_addr["acc_o"] + 32 * KB,
-                    acc_s_ub: ub_addr["acc_s_ub"],
-                    acc_s_ub_: ub_addr["acc_s_ub_"],
-                    acc_s_half: ub_addr["acc_s_half"],
-                    m_i: ub_addr["m_i"],
-                    m_i_prev: ub_addr["m_i_prev"],
-                    sumexp: ub_addr["sumexp"],
-                    sumexp_i_ub: ub_addr["sumexp_i_ub"],
-                    lse_ub: ub_addr["lse_ub"],
-                    sinks_ub: ub_addr["sinks_ub"],
-                    idx_int: ub_addr["idx_int"],
-                    idx_float: ub_addr["idx_float"],
-                    alpha: ub_addr["alpha"],
-                    mask_ub: ub_addr["mask_ub"],
-                    mask_sel: ub_addr["mask_sel"],
-                    acc_o_half: ub_addr["acc_o_half"],
-                    softmax_tmp: ub_addr["kv_ub_multi"],
-                    alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
-                    sumexp_sv: ub_addr["mask_sel"] + 32,
-                    m_i_sv: ub_addr["mask_sel"] + 32 + 256,
-                    sumexp_rt: ub_addr["mask_sel"] + 32 + 512,
-                    m_i_rt: ub_addr["mask_sel"] + 32 + 640,
-                    recip: ub_addr["mask_sel"] + 32 + 768,
-                    recip_brd8: ub_addr["mask_sel"] + 32 + 896,
-                }
-                if is_cfa:
-                    # 64KB cmp-KV half in the L1 headroom after p_hi (400KB).
-                    _l1ub_addr[cmp_kv_l1] = 400 * KB
-                T.annotate_address(_l1ub_addr)
+                T.annotate_address(
+                    {
+                        q_l1: 0,
+                        kv_lo: 128 * KB,
+                        kv_hi: 256 * KB,
+                        p_lo: 384 * KB,
+                        p_hi: 392 * KB,
+                        acc_s_a: 0,
+                        acc_s_b: 64 * KB,
+                        acc_o_l0c: l0c_addr["acc_o_l0c"],
+                        acc_o_work: ub_addr["acc_o"],
+                        acc_o_work2: ub_addr["acc_o"] + 32 * KB,
+                        acc_s_ub: ub_addr["acc_s_ub"],
+                        acc_s_ub_: ub_addr["acc_s_ub_"],
+                        acc_s_half: ub_addr["acc_s_half"],
+                        m_i: ub_addr["m_i"],
+                        m_i_prev: ub_addr["m_i_prev"],
+                        sumexp: ub_addr["sumexp"],
+                        sumexp_i_ub: ub_addr["sumexp_i_ub"],
+                        lse_ub: ub_addr["lse_ub"],
+                        sinks_ub: ub_addr["sinks_ub"],
+                        idx_int: ub_addr["idx_int"],
+                        idx_float: ub_addr["idx_float"],
+                        alpha: ub_addr["alpha"],
+                        mask_ub: ub_addr["mask_ub"],
+                        mask_sel: ub_addr["mask_sel"],
+                        acc_o_half: ub_addr["acc_o_half"],
+                        softmax_tmp: ub_addr["kv_ub_multi"],
+                        alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
+                        sumexp_sv: ub_addr["mask_sel"] + 32,
+                        m_i_sv: ub_addr["mask_sel"] + 32 + 256,
+                        sumexp_rt: ub_addr["mask_sel"] + 32 + 512,
+                        m_i_rt: ub_addr["mask_sel"] + 32 + 640,
+                        recip: ub_addr["mask_sel"] + 32 + 768,
+                        recip_brd8: ub_addr["mask_sel"] + 32 + 896,
+                        # CFA: 64KB cmp-KV L1 half in the headroom after p_hi (400KB).
+                        **({cmp_kv_l1: 400 * KB} if is_cfa else {}),
+                    }
+                )
 
                 # ---- This core's metadata-assigned work range. ----
                 # Materialize the loop-invariant scalars ONCE (alloc_var): as plain
