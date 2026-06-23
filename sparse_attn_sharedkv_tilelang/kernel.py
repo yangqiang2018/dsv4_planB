@@ -774,6 +774,13 @@ def build_sparse_attn_sharedkv(
                                 T.set_flag("m", "fix", 1)
                                 T.wait_flag("m", "fix", 1)
                                 T.copy(acc_o_l0c, ws_o_cmp[cid, pb, 0:H_per_block, 0:D])
+                                # TEMP fix-test: drain the ws_o_cmp fixpipe (FIX pipe)
+                                # BEFORE PV_READY so its GM write is committed before
+                                # the vector's first (pass1) read -- ws_o_cmp is the
+                                # cube's LAST write before the cross-core flag, so
+                                # unlike ws_o it has no drain time.
+                                T.set_flag("fix", "m", 2)
+                                T.wait_flag("fix", "m", 2)
                                 T.set_flag("fix", "m", 0)
                                 T.set_flag("fix", "m", 1)
                             # PV_READY after BOTH ori and cmp PV are written.
