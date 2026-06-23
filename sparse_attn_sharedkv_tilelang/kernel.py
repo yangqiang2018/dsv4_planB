@@ -1062,6 +1062,9 @@ def build_sparse_attn_sharedkv(
                                 T.pipe_barrier("v")
                                 T.tile.add(acc_o_work, acc_o_work, acc_o_work2)
                                 T.pipe_barrier("v")
+                                # acc_o_work2 (cmp temp) now free -> pass-2 reloads it
+                                # as O_ori (V->MTE2 fence, R1).
+                                T.set_flag("v", "mte2", 8)
                             T.tile.brcb(
                                 recip_brd8,
                                 recip[0:MERGE_HEADS],
@@ -1075,6 +1078,12 @@ def build_sparse_attn_sharedkv(
                             )
                             T.pipe_barrier("v")
                             T.copy(acc_o_work, acc_o_half[0:MERGE_HEADS, :])
+                            for _ in range(1 if NI_cmp > 0 else 0):
+                                # acc_o_work now free -> pass-2 reuses it as the cmp
+                                # temp (V->MTE2 fence, R2); and wait for pass-1's read
+                                # of acc_o_work2 before reloading it as O_ori (R1).
+                                T.set_flag("v", "mte2", 9)
+                                T.wait_flag("v", "mte2", 8)
                             T.copy(
                                 ws_o[
                                     cid,
@@ -1090,6 +1099,7 @@ def build_sparse_attn_sharedkv(
                             # CFA pass-2 merge: acc_o_work2 = alpha*O_ori + O_cmp
                             # (acc_o_work, free after pass 1's copy, is the cmp temp).
                             for _ in range(1 if NI_cmp > 0 else 0):
+                                T.wait_flag("v", "mte2", 9)
                                 T.copy(
                                     ws_o_cmp[
                                         cid,
