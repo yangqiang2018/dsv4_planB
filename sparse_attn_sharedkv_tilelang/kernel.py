@@ -1079,9 +1079,9 @@ def build_sparse_attn_sharedkv(
                                     8,
                                 )
                                 T.pipe_barrier("v")
-                                # TEMP probe (revert): SKIP pass-1 alpha-rescale +
-                                # O_cmp add so pass-1 = O_ori/sumexp (= SWA). If token0
-                                # then goes clean, the cmp-merge ops are the culprit.
+                                # TEMP probe2 (revert): alpha row_muls SKIPPED, O_cmp
+                                # add ENABLED. token0 bad => acc_o_work2 (O_cmp via
+                                # ws_o_cmp) is the corruptor; clean => the alpha path.
                                 for _ in range(0):
                                     T.tile.row_muls(
                                         acc_o_work,
@@ -1091,8 +1091,7 @@ def build_sparse_attn_sharedkv(
                                         D,
                                         D,
                                     )
-                                    T.pipe_barrier("v")
-                                    T.tile.add(acc_o_work, acc_o_work, acc_o_work2)
+                                T.tile.add(acc_o_work, acc_o_work, acc_o_work2)
                                 T.pipe_barrier("v")
                                 # acc_o_work2 (cmp temp) now free -> pass-2 reloads it
                                 # as O_ori (V->MTE2 fence, R1).
@@ -1152,8 +1151,8 @@ def build_sparse_attn_sharedkv(
                                     8,
                                 )
                                 T.pipe_barrier("v")
-                                # TEMP probe (revert): SKIP pass-2 alpha-rescale +
-                                # O_cmp add so pass-2 = O_ori/sumexp (= SWA).
+                                # TEMP probe2 (revert): alpha row_muls SKIPPED, O_cmp
+                                # add ENABLED.
                                 for _ in range(0):
                                     T.tile.row_muls(
                                         acc_o_work2,
@@ -1163,8 +1162,7 @@ def build_sparse_attn_sharedkv(
                                         D,
                                         D,
                                     )
-                                    T.pipe_barrier("v")
-                                    T.tile.add(acc_o_work2, acc_o_work2, acc_o_work)
+                                T.tile.add(acc_o_work2, acc_o_work2, acc_o_work)
                                 T.pipe_barrier("v")
                             T.tile.brcb(
                                 recip_brd8,
