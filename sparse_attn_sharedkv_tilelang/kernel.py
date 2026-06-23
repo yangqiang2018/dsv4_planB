@@ -182,21 +182,15 @@ def build_sparse_attn_sharedkv(
     is_cfa = scenario >= 2
     NI_cmp_eff = max(NI_cmp, 1)  # workspace tile dim (>=1 so SWA allocs a dummy)
 
-    # CFA cmp-tile paged-gather plan, precomputed at BUILD time (Python ints) so
-    # the kernel body emits constant page indices with NO runtime branch / dead
-    # code (TVMScript turns a Python `if` on a TIR value into an IfThenElse, which
-    # would also static-OOB-index the page table on the untaken branch). Requires
-    # cmp_block_size to be a multiple of BI, so each BI_half KV chunk lies entirely
-    # within one page block (one DataCopy per half).
-    cmp_lo_bidx = cmp_lo_row = cmp_hi_bidx = cmp_hi_row = None
+    # CFA requires cmp_block_size to be a multiple of BI, so each BI_half KV chunk
+    # of a dense cmp tile lies entirely within one page block (one DataCopy per
+    # half, no segment split). The per-tile page index/row are computed in-body as
+    # TIR expressions of the loop var (a Python list indexed by the TIR loop Var
+    # fails: "list indices must be ... not Var").
     if is_cfa:
         assert cmp_block_size % BI == 0, (
             "CFA: cmp_block_size must be a multiple of BI (BI-aligned cmp paging)"
         )
-        cmp_lo_bidx = [(t * BI) // cmp_block_size for t in range(NI_cmp)]
-        cmp_lo_row = [(t * BI) % cmp_block_size for t in range(NI_cmp)]
-        cmp_hi_bidx = [(t * BI + BI_half) // cmp_block_size for t in range(NI_cmp)]
-        cmp_hi_row = [(t * BI + BI_half) % cmp_block_size for t in range(NI_cmp)]
 
     @tilelang.jit(out_idx=[11, 12], workspace_idx=[13, 14, 15, 16, 17, 18])
     def _make():
@@ -576,84 +570,89 @@ def build_sparse_attn_sharedkv(
                             T.set_flag("fix", "m", 1)
                             T.set_cross_flag("FIX", _FLAG_SCORE_READY)
 
-                            # Compile-time gate via range() (NI_cmp==0 -> nothing
-                            # emitted for SWA), NOT `if is_cfa:` which TVMScript
-                            # turns into a runtime/​scoped IfFrame.
-                            for _ in range(1 if NI_cmp > 0 else 0):
-                                # ---- CFA dense compressed QK: Q @ cmp_kv^T over
-                                # NI_cmp dense tiles [t*BI, t*BI+BI). Mirrors the
-                                # ori paged gather but from cmp_KV via
-                                # cmp_block_table; reuses acc_s_a/acc_s_b (free
-                                # after the ori fixpipe) and one reused cmp KV L1
-                                # half. Per-tile page indices are precomputed
-                                # (Python ints) -> constant indices, no runtime
-                                # branch. Writes ws_score_cmp; vector merge + cmp
-                                # PV come in the next increment. ----
-                                for tcmp in range(NI_cmp):
-                                    # -- lo half [t*BI, t*BI+BI_half) (one block) --
-                                    T.wait_flag("m", "mte2", 6)
-                                    T.copy(
-                                        cmp_KV[
-                                            cmp_block_table[b0, cmp_lo_bidx[tcmp]],
-                                            cmp_lo_row[tcmp] : cmp_lo_row[tcmp]
-                                            + BI_half,
-                                            0,
-                                            :,
+                            # ---- CFA dense compressed QK: Q @ cmp_kv^T over NI_cmp
+                            # dense tiles [t*BI, t*BI+BI). Mirrors the ori paged
+                            # gather but from cmp_KV via cmp_block_table; reuses
+                            # acc_s_a/acc_s_b (free after the ori fixpipe) and one
+                            # reused cmp KV L1 half. T.serial(NI_cmp) is a TIR For
+                            # (empty for SWA where NI_cmp==0). Page index/row are
+                            # TIR expressions of the loop var (cmp_block_size % BI
+                            # == 0 -> each half is within one block). Writes
+                            # ws_score_cmp; vector merge + cmp PV come next. ----
+                            for tcmp in T.serial(NI_cmp):
+                                # -- lo half [t*BI, t*BI+BI_half) (one block) --
+                                T.wait_flag("m", "mte2", 6)
+                                T.copy(
+                                    cmp_KV[
+                                        cmp_block_table[
+                                            b0, (tcmp * BI) // cmp_block_size
                                         ],
-                                        cmp_kv_l1[0:BI_half, :],
-                                    )
-                                    T.set_flag("mte2", "m", 6)
-                                    T.wait_flag("mte2", "m", 6)
-                                    T.wait_flag("fix", "m", 0)
-                                    T.gemm_v0(
-                                        q_l1[pa, :, :],
-                                        cmp_kv_l1,
-                                        acc_s_a,
-                                        transpose_B=True,
-                                        init=True,
-                                        unit_flag=True,
-                                    )
-                                    T.fixpipe(
-                                        acc_s_a,
-                                        ws_score_cmp[
-                                            cid, pa, tcmp, 0:H_per_block, 0:BI_half
+                                        (tcmp * BI) % cmp_block_size : (tcmp * BI)
+                                        % cmp_block_size
+                                        + BI_half,
+                                        0,
+                                        :,
+                                    ],
+                                    cmp_kv_l1[0:BI_half, :],
+                                )
+                                T.set_flag("mte2", "m", 6)
+                                T.wait_flag("mte2", "m", 6)
+                                T.wait_flag("fix", "m", 0)
+                                T.gemm_v0(
+                                    q_l1[pa, :, :],
+                                    cmp_kv_l1,
+                                    acc_s_a,
+                                    transpose_B=True,
+                                    init=True,
+                                    unit_flag=True,
+                                )
+                                T.fixpipe(
+                                    acc_s_a,
+                                    ws_score_cmp[
+                                        cid, pa, tcmp, 0:H_per_block, 0:BI_half
+                                    ],
+                                    unit_flag=0b11,
+                                )
+                                T.set_flag("fix", "m", 0)
+                                T.set_flag("m", "mte2", 6)
+                                # -- hi half [t*BI+BI_half, t*BI+BI) (one block) --
+                                T.wait_flag("m", "mte2", 6)
+                                T.copy(
+                                    cmp_KV[
+                                        cmp_block_table[
+                                            b0,
+                                            (tcmp * BI + BI_half) // cmp_block_size,
                                         ],
-                                        unit_flag=0b11,
-                                    )
-                                    T.set_flag("fix", "m", 0)
-                                    T.set_flag("m", "mte2", 6)
-                                    # -- hi half [t*BI+BI_half, t*BI+BI) (one block) --
-                                    T.wait_flag("m", "mte2", 6)
-                                    T.copy(
-                                        cmp_KV[
-                                            cmp_block_table[b0, cmp_hi_bidx[tcmp]],
-                                            cmp_hi_row[tcmp] : cmp_hi_row[tcmp]
-                                            + BI_half,
-                                            0,
-                                            :,
-                                        ],
-                                        cmp_kv_l1[0:BI_half, :],
-                                    )
-                                    T.set_flag("mte2", "m", 6)
-                                    T.wait_flag("mte2", "m", 6)
-                                    T.wait_flag("fix", "m", 1)
-                                    T.gemm_v0(
-                                        q_l1[pa, :, :],
-                                        cmp_kv_l1,
-                                        acc_s_b,
-                                        transpose_B=True,
-                                        init=True,
-                                        unit_flag=True,
-                                    )
-                                    T.fixpipe(
-                                        acc_s_b,
-                                        ws_score_cmp[
-                                            cid, pa, tcmp, 0:H_per_block, BI_half:BI
-                                        ],
-                                        unit_flag=0b11,
-                                    )
-                                    T.set_flag("fix", "m", 1)
-                                    T.set_flag("m", "mte2", 6)
+                                        (tcmp * BI + BI_half) % cmp_block_size : (
+                                            tcmp * BI + BI_half
+                                        )
+                                        % cmp_block_size
+                                        + BI_half,
+                                        0,
+                                        :,
+                                    ],
+                                    cmp_kv_l1[0:BI_half, :],
+                                )
+                                T.set_flag("mte2", "m", 6)
+                                T.wait_flag("mte2", "m", 6)
+                                T.wait_flag("fix", "m", 1)
+                                T.gemm_v0(
+                                    q_l1[pa, :, :],
+                                    cmp_kv_l1,
+                                    acc_s_b,
+                                    transpose_B=True,
+                                    init=True,
+                                    unit_flag=True,
+                                )
+                                T.fixpipe(
+                                    acc_s_b,
+                                    ws_score_cmp[
+                                        cid, pa, tcmp, 0:H_per_block, BI_half:BI
+                                    ],
+                                    unit_flag=0b11,
+                                )
+                                T.set_flag("fix", "m", 1)
+                                T.set_flag("m", "mte2", 6)
 
                         if valid1:
                             pb = (g - 1) % 2
