@@ -251,6 +251,11 @@ def build_sparse_attn_sharedkv(
                 # frame they are defined in, so an `if is_cfa:` alloc would be
                 # invisible later; SWA never touches it (NI_cmp==0) -> DCE'd.
                 cmp_kv_l1 = T.alloc_L1([BI_half, D], dtype)
+                # CFA cmp PV reads P_cmp into its OWN L1 halves (not the ori p_lo/
+                # p_hi) so there is no ori-PV<->cmp-PV p-buffer reuse baton. 8KB each
+                # in the L1 headroom after cmp_kv_l1.
+                p_cmp_lo = T.alloc_L1([H_per_block, BI_half], dtype)
+                p_cmp_hi = T.alloc_L1([H_per_block, BI_half], dtype)
                 # Two score accumulators so the two QK halves overlap with their
                 # L0C->GM fixpipe copies; one output accumulator for P@V.
                 acc_s_a = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
@@ -291,6 +296,7 @@ def build_sparse_attn_sharedkv(
                 # CFA: per-pid saved cmp-tile flash rescale alpha = exp(m_ori -
                 # m_cmp), applied to the ori P@V at output-merge time (valid2).
                 alpha_cmp_sv = T.alloc_ub([2, ub_len], accum_dtype)
+                alpha_cmp_rt = T.alloc_ub([ub_len], accum_dtype)
 
                 # Address map. cmp_kv_l1 (64KB in the L1 headroom after p_hi) is
                 # always included; for SWA it is unused and DCE'd. A single literal
@@ -305,6 +311,8 @@ def build_sparse_attn_sharedkv(
                         p_lo: 384 * KB,
                         p_hi: 392 * KB,
                         cmp_kv_l1: 400 * KB,
+                        p_cmp_lo: 464 * KB,
+                        p_cmp_hi: 472 * KB,
                         acc_s_a: 0,
                         acc_s_b: 64 * KB,
                         acc_o_l0c: l0c_addr["acc_o_l0c"],
@@ -334,6 +342,7 @@ def build_sparse_attn_sharedkv(
                         recip: ub_addr["mask_sel"] + 32 + 768,
                         recip_brd8: ub_addr["mask_sel"] + 32 + 896,
                         alpha_cmp_sv: ub_addr["mask_sel"] + 32 + 1408,
+                        alpha_cmp_rt: ub_addr["mask_sel"] + 32 + 1664,
                     }
                 )
 
@@ -668,6 +677,8 @@ def build_sparse_attn_sharedkv(
 
                         if valid1:
                             pb = (g - 1) % 2
+                            # query g-1's batch, for the CFA cmp PV re-gather.
+                            b1 = T.if_then_else(in_range1, pid1 // max_seq, 0)
                             # --- P@V: read P (softmax output) from the vector side. ---
                             T.wait_cross_flag(_FLAG_P_READY)
                             T.copy(ws_p[cid, pb, 0:H_per_block, 0:BI_half], p_lo)
@@ -684,6 +695,74 @@ def build_sparse_attn_sharedkv(
                             T.copy(acc_o_l0c, ws_o[cid, pb, 0:H_per_block, 0:D])
                             T.set_flag("fix", "m", 0)
                             T.set_flag("fix", "m", 1)
+                            # ---- CFA cmp PV: P_cmp @ V_cmp -> acc_o_l0c (reused
+                            # after the ori PV copy-out) -> ws_o_cmp. Re-gathers cmp
+                            # KV (query g-1, batch b1) into cmp_kv_l1 (lo then hi, the
+                            # SAME m/mte2(6) baton as the cmp QK) and reads P_cmp into
+                            # its own p_cmp_lo/p_cmp_hi (mte2/m 7 fence). Faithful to
+                            # swa_block_cube.h ComputeMm2 isOri=false. ----
+                            for tcmp in T.serial(NI_cmp):
+                                # -- lo half --
+                                T.wait_flag("m", "mte2", 6)
+                                T.copy(
+                                    cmp_KV[
+                                        cmp_block_table[
+                                            b1, (tcmp * BI) // cmp_block_size
+                                        ],
+                                        (tcmp * BI) % cmp_block_size : (tcmp * BI)
+                                        % cmp_block_size
+                                        + BI_half,
+                                        0,
+                                        :,
+                                    ],
+                                    cmp_kv_l1[0:BI_half, :],
+                                )
+                                T.set_flag("mte2", "m", 6)
+                                T.copy(
+                                    ws_p_cmp[cid, pb, 0:H_per_block, 0:BI_half],
+                                    p_cmp_lo,
+                                )
+                                T.set_flag("mte2", "m", 7)
+                                T.wait_flag("mte2", "m", 6)
+                                T.wait_flag("mte2", "m", 7)
+                                T.wait_flag("fix", "m", 0)
+                                T.wait_flag("fix", "m", 1)
+                                T.gemm_v0(p_cmp_lo, cmp_kv_l1, acc_o_l0c, init=True)
+                                T.set_flag("m", "mte2", 6)
+                                # -- hi half --
+                                T.wait_flag("m", "mte2", 6)
+                                T.copy(
+                                    cmp_KV[
+                                        cmp_block_table[
+                                            b1,
+                                            (tcmp * BI + BI_half) // cmp_block_size,
+                                        ],
+                                        (tcmp * BI + BI_half) % cmp_block_size : (
+                                            tcmp * BI + BI_half
+                                        )
+                                        % cmp_block_size
+                                        + BI_half,
+                                        0,
+                                        :,
+                                    ],
+                                    cmp_kv_l1[0:BI_half, :],
+                                )
+                                T.set_flag("mte2", "m", 6)
+                                T.copy(
+                                    ws_p_cmp[cid, pb, 0:H_per_block, BI_half:BI],
+                                    p_cmp_hi,
+                                )
+                                T.set_flag("mte2", "m", 7)
+                                T.wait_flag("mte2", "m", 6)
+                                T.wait_flag("mte2", "m", 7)
+                                T.gemm_v0(p_cmp_hi, cmp_kv_l1, acc_o_l0c, init=False)
+                                T.set_flag("m", "mte2", 6)
+                                T.set_flag("m", "fix", 1)
+                                T.wait_flag("m", "fix", 1)
+                                T.copy(acc_o_l0c, ws_o_cmp[cid, pb, 0:H_per_block, 0:D])
+                                T.set_flag("fix", "m", 0)
+                                T.set_flag("fix", "m", 1)
+                            # PV_READY after BOTH ori and cmp PV are written.
                             T.set_cross_flag("FIX", _FLAG_PV_READY)
                     T.wait_flag("fix", "m", 0)
                     T.wait_flag("fix", "m", 1)
@@ -913,6 +992,10 @@ def build_sparse_attn_sharedkv(
                             T.wait_cross_flag(_FLAG_PV_READY)
                             T.copy(sumexp_sv[pv2, :], sumexp_rt)
                             T.copy(m_i_sv[pv2, :], m_i_rt)
+                            # CFA: load the cmp rescale alpha = exp(m_ori - m_cmp)
+                            # for the O = alpha*O_ori + O_cmp merge below.
+                            for _ in range(1 if NI_cmp > 0 else 0):
+                                T.copy(alpha_cmp_sv[pv2, :], alpha_cmp_rt)
                             T.pipe_barrier("v")
                             T.copy(
                                 ws_o[
@@ -930,6 +1013,41 @@ def build_sparse_attn_sharedkv(
                             T.tile.reciprocal(recip, sumexp_rt)
                             T.pipe_barrier("v")
                             T.wait_flag("mte2", "v", 2)
+                            # CFA pass-1 merge: acc_o_work = alpha*O_ori + O_cmp
+                            # (acc_o_work2 is the cmp temp; freed before pass 2 needs
+                            # it for O_ori). The recip-normalize below then divides by
+                            # the post-cmp sumexp.
+                            for _ in range(1 if NI_cmp > 0 else 0):
+                                T.copy(
+                                    ws_o_cmp[
+                                        cid,
+                                        pv2,
+                                        vid * v_block : vid * v_block + MERGE_HEADS,
+                                        :,
+                                    ],
+                                    acc_o_work2,
+                                )
+                                T.set_flag("mte2", "v", 6)
+                                T.wait_flag("mte2", "v", 6)
+                                T.tile.brcb(
+                                    recip_brd8,
+                                    alpha_cmp_rt[0:MERGE_HEADS],
+                                    (MERGE_HEADS + 7) // 8,
+                                    1,
+                                    8,
+                                )
+                                T.pipe_barrier("v")
+                                T.tile.row_muls(
+                                    acc_o_work,
+                                    acc_o_work,
+                                    recip_brd8,
+                                    MERGE_HEADS,
+                                    D,
+                                    D,
+                                )
+                                T.pipe_barrier("v")
+                                T.tile.add(acc_o_work, acc_o_work, acc_o_work2)
+                                T.pipe_barrier("v")
                             T.tile.brcb(
                                 recip_brd8,
                                 recip[0:MERGE_HEADS],
@@ -955,6 +1073,40 @@ def build_sparse_attn_sharedkv(
                             )
                             T.set_flag("mte2", "v", 3)
                             T.wait_flag("mte2", "v", 3)
+                            # CFA pass-2 merge: acc_o_work2 = alpha*O_ori + O_cmp
+                            # (acc_o_work, free after pass 1's copy, is the cmp temp).
+                            for _ in range(1 if NI_cmp > 0 else 0):
+                                T.copy(
+                                    ws_o_cmp[
+                                        cid,
+                                        pv2,
+                                        vid * v_block + MERGE_HEADS : vid * v_block
+                                        + 2 * MERGE_HEADS,
+                                        :,
+                                    ],
+                                    acc_o_work,
+                                )
+                                T.set_flag("mte2", "v", 7)
+                                T.wait_flag("mte2", "v", 7)
+                                T.tile.brcb(
+                                    recip_brd8,
+                                    alpha_cmp_rt[MERGE_HEADS : 2 * MERGE_HEADS],
+                                    (MERGE_HEADS + 7) // 8,
+                                    1,
+                                    8,
+                                )
+                                T.pipe_barrier("v")
+                                T.tile.row_muls(
+                                    acc_o_work2,
+                                    acc_o_work2,
+                                    recip_brd8,
+                                    MERGE_HEADS,
+                                    D,
+                                    D,
+                                )
+                                T.pipe_barrier("v")
+                                T.tile.add(acc_o_work2, acc_o_work2, acc_o_work)
+                                T.pipe_barrier("v")
                             T.tile.brcb(
                                 recip_brd8,
                                 recip[MERGE_HEADS : 2 * MERGE_HEADS],
