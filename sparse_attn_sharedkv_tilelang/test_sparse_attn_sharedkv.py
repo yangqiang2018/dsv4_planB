@@ -444,6 +444,15 @@ def _check_result(npu_out: torch.Tensor, expect: torch.Tensor) -> None:
                 + " ".join(f"{i}:{pt[i]:.2f}" for i in range(min(32, pt.size)))
             )
             print(f"[DIAG] #tok with >50% bad: {int((pt > 0.5).sum())}/{pt.size}")
+            # Value dump for token0 head0 (a thr==0 query, cmp should be a no-op).
+            r3 = real.reshape(-1, 64, 512)
+            e3 = expt.reshape(-1, 64, 512)
+            with np.printoptions(precision=4, suppress=True):
+                print(f"[DIAG] tok0 h0 real[:6]: {r3[0, 0, :6]}")
+                print(f"[DIAG] tok0 h0 expt[:6]: {e3[0, 0, :6]}")
+                print(
+                    f"[DIAG] tok0 h0 ratio[:6]: {r3[0, 0, :6] / (e3[0, 0, :6] + 1e-9)}"
+                )
         except Exception as e:  # noqa: BLE001
             print(f"[DIAG] failed: {e}")
 
