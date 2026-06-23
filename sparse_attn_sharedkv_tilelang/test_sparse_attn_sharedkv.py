@@ -491,6 +491,22 @@ def _check_lse(
     rel_err = np.abs(real - expt) / b
     max_rel = float(rel_err[~ok].max()) if n_err > 0 else 0.0
 
+    # TEMP DIAGNOSTIC (revert after CFA debug): per-head LSE bad fraction.
+    # LSE is derived from the SAME saved softmax state (sumexp_sv/m_i_sv) that
+    # feeds the O-normalize recip -- so if heads 0-15 of each lane are bad here
+    # too, the cmp-flash softmax_flashv2 (deal_row_count=32) corrupted new_sum/
+    # new_max for the first 16-row chunk; if LSE is clean, the bug is O-merge only.
+    if fulfill_pct < 99.5:
+        try:
+            ph = (~ok).reshape(-1, 64).mean(axis=0)  # [64]
+            print(f"\n[DIAG-LSE] fulfill={fulfill_pct:.2f}% max_rel={max_rel:.3f}")
+            print(
+                "[DIAG-LSE] bad-frac/head: "
+                + " ".join(f"{i}:{v:.2f}" for i, v in enumerate(ph))
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[DIAG-LSE] failed: {e}")
+
     assert fulfill_pct >= 99.5, (
         f"lse: only {fulfill_pct:.4f}% within tol "
         f"(rtol={rtol}, atol={atol}); 99.5% required; "

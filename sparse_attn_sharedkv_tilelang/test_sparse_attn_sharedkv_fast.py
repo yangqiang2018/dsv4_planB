@@ -123,5 +123,7 @@ def test_sparse_attn_sharedkv_fast(case_name, dtype):
     out, lse, _ = _call_metadata_then_sharedkv(
         case, cfg, sparse_attn_sharedkv, sparse_attn_sharedkv_metadata
     )
-    _check_result(out.cpu(), case["cpu_ref"])
+    # TEMP (CFA debug): run the LSE check FIRST so its per-head diagnostic prints
+    # even when the output check below trips its assert. Revert ordering after.
     _check_lse(lse.cpu(), case["cpu_ref_lse"], dtype)
+    _check_result(out.cpu(), case["cpu_ref"])
