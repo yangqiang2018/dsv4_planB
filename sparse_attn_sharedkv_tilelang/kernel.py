@@ -1079,16 +1079,20 @@ def build_sparse_attn_sharedkv(
                                     8,
                                 )
                                 T.pipe_barrier("v")
-                                T.tile.row_muls(
-                                    acc_o_work,
-                                    acc_o_work,
-                                    recip_brd8,
-                                    MERGE_HEADS,
-                                    D,
-                                    D,
-                                )
-                                T.pipe_barrier("v")
-                                T.tile.add(acc_o_work, acc_o_work, acc_o_work2)
+                                # TEMP probe (revert): SKIP pass-1 alpha-rescale +
+                                # O_cmp add so pass-1 = O_ori/sumexp (= SWA). If token0
+                                # then goes clean, the cmp-merge ops are the culprit.
+                                for _ in range(0):
+                                    T.tile.row_muls(
+                                        acc_o_work,
+                                        acc_o_work,
+                                        recip_brd8,
+                                        MERGE_HEADS,
+                                        D,
+                                        D,
+                                    )
+                                    T.pipe_barrier("v")
+                                    T.tile.add(acc_o_work, acc_o_work, acc_o_work2)
                                 T.pipe_barrier("v")
                                 # acc_o_work2 (cmp temp) now free -> pass-2 reloads it
                                 # as O_ori (V->MTE2 fence, R1).
@@ -1148,16 +1152,19 @@ def build_sparse_attn_sharedkv(
                                     8,
                                 )
                                 T.pipe_barrier("v")
-                                T.tile.row_muls(
-                                    acc_o_work2,
-                                    acc_o_work2,
-                                    recip_brd8,
-                                    MERGE_HEADS,
-                                    D,
-                                    D,
-                                )
-                                T.pipe_barrier("v")
-                                T.tile.add(acc_o_work2, acc_o_work2, acc_o_work)
+                                # TEMP probe (revert): SKIP pass-2 alpha-rescale +
+                                # O_cmp add so pass-2 = O_ori/sumexp (= SWA).
+                                for _ in range(0):
+                                    T.tile.row_muls(
+                                        acc_o_work2,
+                                        acc_o_work2,
+                                        recip_brd8,
+                                        MERGE_HEADS,
+                                        D,
+                                        D,
+                                    )
+                                    T.pipe_barrier("v")
+                                    T.tile.add(acc_o_work2, acc_o_work2, acc_o_work)
                                 T.pipe_barrier("v")
                             T.tile.brcb(
                                 recip_brd8,
