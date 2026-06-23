@@ -333,8 +333,22 @@ def build_sparse_attn_sharedkv(
                         mask_ub: ub_addr["mask_ub"],
                         mask_sel: ub_addr["mask_sel"],
                         acc_o_half: ub_addr["acc_o_half"],
-                        softmax_tmp: ub_addr["kv_ub_multi"],
-                        alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
+                        # softmax_tmp + alpha_exp moved OUT of the kv_ub_multi
+                        # region (64KB) into the free [104KB,128KB) UB gap
+                        # (acc_s_half ends @104KB, acc_s_ub_ starts @128KB).
+                        # acc_o_half[0:16] (bf16, bytes [64KB,80KB)) used to ALIAS
+                        # softmax_tmp byte-for-byte -> the NEXT query's valid1
+                        # softmax_flashv2 (V) raced THIS query's Output DMA (MTE3
+                        # reading acc_o_half[0:16]), corrupting the first 16 heads
+                        # of every vector lane. Data-independent: even thr==0
+                        # tokens (cmp a no-op) failed. SWA hid it (one
+                        # softmax_flashv2 + short valid2 -> the DMA drained first);
+                        # CFA's 2nd flash + longer cmp-merge valid2 made the
+                        # cross-iteration race fire. Ascend C keeps these in
+                        # DISTINCT TBufs (outputBuff1 vs softmaxTmpUb); un-aliasing
+                        # restores that separation (no extra UB, no serialization).
+                        softmax_tmp: 104 * KB,
+                        alpha_exp: 104 * KB + 16 * KB + 512,
                         sumexp_sv: ub_addr["mask_sel"] + 32,
                         m_i_sv: ub_addr["mask_sel"] + 32 + 256,
                         sumexp_rt: ub_addr["mask_sel"] + 32 + 512,
