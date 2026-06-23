@@ -899,6 +899,10 @@ def build_sparse_attn_sharedkv(
                             T.copy(sumexp, sumexp_sv[pv1, :])
                             T.copy(m_i, m_i_sv[pv1, :])
                             T.copy(acc_s_ub, acc_s_half)
+                            # ori V is now done reading acc_s_ub -> let the cmp MTE2
+                            # load reuse it (V->MTE2 fence, CFA only).
+                            for _ in range(1 if NI_cmp > 0 else 0):
+                                T.set_flag("v", "mte2", 6)
                             T.set_flag("v", "mte3", 0)
                             T.wait_flag("v", "mte3", 0)
                             T.copy(
@@ -907,6 +911,12 @@ def build_sparse_attn_sharedkv(
                                     cid, pv1, vid * v_block : vid * v_block + v_block, :
                                 ],
                             )
+                            # ori MTE3 is now done reading acc_s_half -> let the cmp V
+                            # reuse it (MTE3->V fence, CFA only). Without these two
+                            # fences the cmp clobbers acc_s_ub/acc_s_half while ori's
+                            # P->ws_p is still in flight -> ori P corrupted.
+                            for _ in range(1 if NI_cmp > 0 else 0):
+                                T.set_flag("mte3", "v", 6)
                             # ---- CFA: second flash over the dense cmp tile, merged
                             # into the running (m_i, sumexp) (Ascend C
                             # SoftmaxFlashV2Compute, isFirstSInnerLoop=false). Reuses
@@ -918,6 +928,10 @@ def build_sparse_attn_sharedkv(
                             # rescale alpha = exp(m_ori - m_cmp) for the valid2 merge.
                             # range() gate so SWA (NI_cmp==0) emits nothing. ----
                             for _ in range(1 if NI_cmp > 0 else 0):
+                                # Wait for ori to finish with acc_s_ub (V read) and
+                                # acc_s_half (MTE3 read) before the cmp reuses them.
+                                T.wait_flag("v", "mte2", 6)
+                                T.wait_flag("mte3", "v", 6)
                                 T.copy(
                                     ws_score_cmp[
                                         cid,
