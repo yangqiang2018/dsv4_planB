@@ -774,13 +774,6 @@ def build_sparse_attn_sharedkv(
                                 T.set_flag("m", "fix", 1)
                                 T.wait_flag("m", "fix", 1)
                                 T.copy(acc_o_l0c, ws_o_cmp[cid, pb, 0:H_per_block, 0:D])
-                                # TEMP fix-test: drain the ws_o_cmp fixpipe (FIX pipe)
-                                # BEFORE PV_READY so its GM write is committed before
-                                # the vector's first (pass1) read -- ws_o_cmp is the
-                                # cube's LAST write before the cross-core flag, so
-                                # unlike ws_o it has no drain time.
-                                T.set_flag("fix", "m", 2)
-                                T.wait_flag("fix", "m", 2)
                                 T.set_flag("fix", "m", 0)
                                 T.set_flag("fix", "m", 1)
                             # PV_READY after BOTH ori and cmp PV are written.
@@ -1056,16 +1049,19 @@ def build_sparse_attn_sharedkv(
                                 acc_o_work,
                             )
                             T.set_flag("mte2", "v", 2)
-                            # Batched normalize O[h,:] /= sumexp[h]: one reciprocal
-                            # over all heads, then a per-row broadcast multiply
-                            # (brcb + row_muls) -- replaces the per-head div loop.
                             T.tile.reciprocal(recip, sumexp_rt)
                             T.pipe_barrier("v")
                             T.wait_flag("mte2", "v", 2)
-                            # CFA pass-1 merge: acc_o_work = alpha*O_ori + O_cmp
-                            # (acc_o_work2 is the cmp temp; freed before pass 2 needs
-                            # it for O_ori). The recip-normalize below then divides by
-                            # the post-cmp sumexp.
+                            # Pass-1 faithful merge (Ascend C DealBmm2ResBaseBlock):
+                            # accumulator = O_cmp tile -> acc_o_work2 (= bmm2ResUb);
+                            # O_ori -> acc_o_work (= bmm2ResPreUb), alpha-rescaled IN
+                            # PLACE on the separate buffer; Add accumulates alpha*O_ori
+                            # INTO acc_o_work2; the recip-normalize (RowDivs) then
+                            # divides acc_o_work2 (@32768). The post-add normalize is
+                            # NEVER on acc_o_work (@0) -- a post-add row_muls on @0
+                            # zeroes the result (codegen hazard; pass-2 has always
+                            # normalized on acc_o_work2 and is correct). Flag ids:
+                            # 8 = acc_o_work2 free, 9 = acc_o_work free.
                             for _ in range(1 if NI_cmp > 0 else 0):
                                 T.copy(
                                     ws_o_cmp[
@@ -1078,38 +1074,10 @@ def build_sparse_attn_sharedkv(
                                 )
                                 T.set_flag("mte2", "v", 6)
                                 T.wait_flag("mte2", "v", 6)
+                                # RowMuls(bmm2ResPreUb = O_ori in acc_o_work) *= alpha.
                                 T.tile.brcb(
                                     recip_brd8,
                                     alpha_cmp_rt[0:MERGE_HEADS],
-                                    (MERGE_HEADS + 7) // 8,
-                                    1,
-                                    8,
-                                )
-                                T.pipe_barrier("v")
-                                # TEMP probe4 (revert): restore the add, then output
-                                # acc_o_work UNNORMALIZED (recip-normalize below is
-                                # range(0)-skipped). token0 real ~= O_ori (large,
-                                # nonzero) => add fine and recip was zeroing; real == 0
-                                # => the add itself zeroed acc_o_work.
-                                for _ in range(0):
-                                    T.tile.row_muls(
-                                        acc_o_work,
-                                        acc_o_work,
-                                        recip_brd8,
-                                        MERGE_HEADS,
-                                        D,
-                                        D,
-                                    )
-                                T.tile.add(acc_o_work, acc_o_work, acc_o_work2)
-                                T.pipe_barrier("v")
-                                # acc_o_work2 (cmp temp) now free -> pass-2 reloads it
-                                # as O_ori (V->MTE2 fence, R1).
-                                T.set_flag("v", "mte2", 8)
-                            # TEMP probe4: recip-normalize SKIPPED (output raw acc_o_work).
-                            for _ in range(0):
-                                T.tile.brcb(
-                                    recip_brd8,
-                                    recip[0:MERGE_HEADS],
                                     (MERGE_HEADS + 7) // 8,
                                     1,
                                     8,
@@ -1123,13 +1091,53 @@ def build_sparse_attn_sharedkv(
                                     D,
                                     D,
                                 )
-                            T.pipe_barrier("v")
-                            T.copy(acc_o_work, acc_o_half[0:MERGE_HEADS, :])
-                            for _ in range(1 if NI_cmp > 0 else 0):
-                                # acc_o_work now free -> pass-2 reuses it as the cmp
-                                # temp (V->MTE2 fence, R2); and wait for pass-1's read
-                                # of acc_o_work2 before reloading it as O_ori (R1).
+                                T.pipe_barrier("v")
+                                # Add(bmm2ResUb = O_cmp accumulator) += alpha*O_ori.
+                                T.tile.add(acc_o_work2, acc_o_work2, acc_o_work)
+                                T.pipe_barrier("v")
+                                # acc_o_work (O_ori) fully consumed -> pass-2 reuses it
+                                # as its O_cmp temp (id 9 = acc_o_work free).
                                 T.set_flag("v", "mte2", 9)
+                            T.tile.brcb(
+                                recip_brd8,
+                                recip[0:MERGE_HEADS],
+                                (MERGE_HEADS + 7) // 8,
+                                1,
+                                8,
+                            )
+                            T.pipe_barrier("v")
+                            for _ in range(1 if NI_cmp > 0 else 0):
+                                # RowDivs on the accumulator acc_o_work2 (@32768).
+                                T.tile.row_muls(
+                                    acc_o_work2,
+                                    acc_o_work2,
+                                    recip_brd8,
+                                    MERGE_HEADS,
+                                    D,
+                                    D,
+                                )
+                                T.pipe_barrier("v")
+                                T.copy(acc_o_work2, acc_o_half[0:MERGE_HEADS, :])
+                                # acc_o_work2 copied out -> pass-2 reloads it as its
+                                # O_ori (id 8 = acc_o_work2 free).
+                                T.set_flag("v", "mte2", 8)
+                            for _ in range(1 if NI_cmp == 0 else 0):
+                                # SWA: no O_cmp -> normalize O_ori on acc_o_work (@0),
+                                # no preceding add (safe; byte-identical to SWA path).
+                                T.tile.row_muls(
+                                    acc_o_work,
+                                    acc_o_work,
+                                    recip_brd8,
+                                    MERGE_HEADS,
+                                    D,
+                                    D,
+                                )
+                                T.pipe_barrier("v")
+                                T.copy(acc_o_work, acc_o_half[0:MERGE_HEADS, :])
+                            # Reload O_ori -> acc_o_work2 (pass-2 accumulator) only
+                            # after pass-1 released acc_o_work2 (id 8). For SWA the
+                            # gate is empty -> pass-1 used acc_o_work, no reuse fence.
+                            for _ in range(1 if NI_cmp > 0 else 0):
                                 T.wait_flag("v", "mte2", 8)
                             T.copy(
                                 ws_o[
@@ -1143,8 +1151,9 @@ def build_sparse_attn_sharedkv(
                             )
                             T.set_flag("mte2", "v", 3)
                             T.wait_flag("mte2", "v", 3)
-                            # CFA pass-2 merge: acc_o_work2 = alpha*O_ori + O_cmp
-                            # (acc_o_work, free after pass 1's copy, is the cmp temp).
+                            # CFA pass-2 merge: acc_o_work2 = alpha*O_ori + O_cmp; the
+                            # post-add normalize is on acc_o_work2 (@32768). Reload
+                            # O_cmp -> acc_o_work after pass-1 released it (id 9).
                             for _ in range(1 if NI_cmp > 0 else 0):
                                 T.wait_flag("v", "mte2", 9)
                                 T.copy(
@@ -1167,17 +1176,15 @@ def build_sparse_attn_sharedkv(
                                     8,
                                 )
                                 T.pipe_barrier("v")
-                                # TEMP probe2 (revert): alpha row_muls SKIPPED, O_cmp
-                                # add ENABLED.
-                                for _ in range(0):
-                                    T.tile.row_muls(
-                                        acc_o_work2,
-                                        acc_o_work2,
-                                        recip_brd8,
-                                        MERGE_HEADS,
-                                        D,
-                                        D,
-                                    )
+                                T.tile.row_muls(
+                                    acc_o_work2,
+                                    acc_o_work2,
+                                    recip_brd8,
+                                    MERGE_HEADS,
+                                    D,
+                                    D,
+                                )
+                                T.pipe_barrier("v")
                                 T.tile.add(acc_o_work2, acc_o_work2, acc_o_work)
                                 T.pipe_barrier("v")
                             T.tile.brcb(
