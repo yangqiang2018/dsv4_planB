@@ -979,6 +979,20 @@ def build_sparse_attn_sharedkv(
                                     BI,
                                     BI,
                                 )
+                                # CFA cmp-tile flash rescale alpha = exp(m_ori -
+                                # m_cmp), computed EXPLICITLY from the running maxes
+                                # rather than softmax_flashv2's per-row exp_out. The
+                                # fused primitive's exp_out is the ONE softmax output
+                                # SWA never consumes (the ori flash discards alpha;
+                                # only new_sum/new_max are validated) -> a per-row
+                                # exp_out error at deal_row_count=32 is invisible in
+                                # SWA and in Ascend C (which always vec-splits to 16
+                                # rows). m_i_prev still holds the post-ori max (the
+                                # primitive reads in_max read-only); m_i is post-cmp.
+                                T.tile.sub(alpha_exp, m_i_prev, m_i)
+                                T.pipe_barrier("v")
+                                T.tile.exp(alpha_exp, alpha_exp)
+                                T.pipe_barrier("v")
                                 T.copy(alpha_exp, alpha_cmp_sv[pv1, :])
                                 T.copy(sumexp, sumexp_sv[pv1, :])
                                 T.copy(m_i, m_i_sv[pv1, :])
