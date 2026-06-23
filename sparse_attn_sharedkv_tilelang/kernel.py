@@ -1086,9 +1086,11 @@ def build_sparse_attn_sharedkv(
                                     8,
                                 )
                                 T.pipe_barrier("v")
-                                # TEMP probe2 (revert): alpha row_muls SKIPPED, O_cmp
-                                # add ENABLED. token0 bad => acc_o_work2 (O_cmp via
-                                # ws_o_cmp) is the corruptor; clean => the alpha path.
+                                # TEMP probe3 (revert): OUTPUT acc_o_work2 (= the O_cmp
+                                # pass1 loaded from ws_o_cmp) directly instead of the
+                                # merge, so the token0/head0 value dump shows
+                                # ws_o_cmp/sumexp. 0 => ws_o_cmp==0 (load/visibility);
+                                # -golden => ws_o_cmp==-O_ori; +golden => ==O_ori.
                                 for _ in range(0):
                                     T.tile.row_muls(
                                         acc_o_work,
@@ -1098,7 +1100,7 @@ def build_sparse_attn_sharedkv(
                                         D,
                                         D,
                                     )
-                                T.tile.add(acc_o_work, acc_o_work, acc_o_work2)
+                                T.copy(acc_o_work2, acc_o_work)
                                 T.pipe_barrier("v")
                                 # acc_o_work2 (cmp temp) now free -> pass-2 reloads it
                                 # as O_ori (V->MTE2 fence, R1).
