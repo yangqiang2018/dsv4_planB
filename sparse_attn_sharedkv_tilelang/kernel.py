@@ -192,7 +192,7 @@ def build_sparse_attn_sharedkv(
             "CFA: cmp_block_size must be a multiple of BI (BI-aligned cmp paging)"
         )
 
-    @tilelang.jit(out_idx=[11, 12], workspace_idx=[13, 14, 15, 16, 17, 18])
+    @tilelang.jit(out_idx=[11, 12], workspace_idx=[13, 14, 15, 16, 17, 18, 19, 20])
     def _make():
         # =================================================================
         # SWA (scenario 1): sliding-window attention only. Each query
@@ -230,6 +230,10 @@ def build_sparse_attn_sharedkv(
             ws_score_cmp: T.Tensor(
                 [core_num, 2, NI_cmp_eff, H_per_block, BI], accum_dtype
             ),
+            # CFA compressed P (softmax probs) and compressed P@V output. SWA
+            # allocates [.,.,.,1]/[.,.,.,1] dummies and never reads them.
+            ws_p_cmp: T.Tensor([core_num, 2, H_per_block, BI], dtype),
+            ws_o_cmp: T.Tensor([core_num, 2, H_per_block, D], accum_dtype),
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 (cube-side) buffers, double-buffered over pid parity. ----
@@ -284,6 +288,9 @@ def build_sparse_attn_sharedkv(
                 # batched output divide (replaces the per-head div loop).
                 recip = T.alloc_ub([ub_len], accum_dtype)
                 recip_brd8 = T.alloc_ub([MERGE_HEADS, 8], accum_dtype)
+                # CFA: per-pid saved cmp-tile flash rescale alpha = exp(m_ori -
+                # m_cmp), applied to the ori P@V at output-merge time (valid2).
+                alpha_cmp_sv = T.alloc_ub([2, ub_len], accum_dtype)
 
                 # Address map. cmp_kv_l1 (64KB in the L1 headroom after p_hi) is
                 # always included; for SWA it is unused and DCE'd. A single literal
@@ -326,6 +333,7 @@ def build_sparse_attn_sharedkv(
                         m_i_rt: ub_addr["mask_sel"] + 32 + 640,
                         recip: ub_addr["mask_sel"] + 32 + 768,
                         recip_brd8: ub_addr["mask_sel"] + 32 + 896,
+                        alpha_cmp_sv: ub_addr["mask_sel"] + 32 + 1408,
                     }
                 )
 
@@ -568,7 +576,6 @@ def build_sparse_attn_sharedkv(
                                 unit_flag=0b11,
                             )
                             T.set_flag("fix", "m", 1)
-                            T.set_cross_flag("FIX", _FLAG_SCORE_READY)
 
                             # ---- CFA dense compressed QK: Q @ cmp_kv^T over NI_cmp
                             # dense tiles [t*BI, t*BI+BI). Mirrors the ori paged
@@ -653,6 +660,11 @@ def build_sparse_attn_sharedkv(
                                 )
                                 T.set_flag("fix", "m", 1)
                                 T.set_flag("m", "mte2", 6)
+                            # Signal the vector ONLY after BOTH ori and cmp QK are
+                            # written (CFA vector reads ws_score AND ws_score_cmp).
+                            # SWA's cmp loop is empty so this sits right after the
+                            # ori QK, unchanged.
+                            T.set_cross_flag("FIX", _FLAG_SCORE_READY)
 
                         if valid1:
                             pb = (g - 1) % 2
@@ -816,8 +828,81 @@ def build_sparse_attn_sharedkv(
                                     cid, pv1, vid * v_block : vid * v_block + v_block, :
                                 ],
                             )
-                            # The cross-flag is MTE3-tied, so it already fences the
-                            # ws_p copy above -- no PIPE_ALL barrier needed.
+                            # ---- CFA: second flash over the dense cmp tile, merged
+                            # into the running (m_i, sumexp) (Ascend C
+                            # SoftmaxFlashV2Compute, isFirstSInnerLoop=false). Reuses
+                            # acc_s_ub (P_ori already copied to ws_p) + acc_s_half.
+                            # Mask mode 3: valid cmp cols = (s_global1+1)//cmp_ratio,
+                            # mask the rest to -inf (running max stays finite -> no
+                            # NaN even when thr==0). Overwrites sumexp_sv/m_i_sv[pv1]
+                            # with the post-cmp running state and saves the cmp
+                            # rescale alpha = exp(m_ori - m_cmp) for the valid2 merge.
+                            # range() gate so SWA (NI_cmp==0) emits nothing. ----
+                            for _ in range(1 if NI_cmp > 0 else 0):
+                                T.copy(
+                                    ws_score_cmp[
+                                        cid,
+                                        pv1,
+                                        0,
+                                        vid * v_block : vid * v_block + v_block,
+                                        :,
+                                    ],
+                                    acc_s_ub,
+                                )
+                                # Fence the GM->UB DMA (MTE2) before reading acc_s_ub
+                                # (pipe_barrier("v") would NOT drain MTE2).
+                                T.set_flag("mte2", "v", 5)
+                                T.wait_flag("mte2", "v", 5)
+                                T.tile.createvecindex(idx_int, 0)
+                                T.copy(idx_int, idx_float)
+                                T.pipe_barrier("v")
+                                T.tile.compare(
+                                    mask_sel,
+                                    idx_float,
+                                    T.float32((s_global1 + 1) // cmp_ratio),
+                                    "LT",
+                                )
+                                T.pipe_barrier("v")
+                                for h_i in T.serial(v_block):
+                                    T.tile.select(
+                                        acc_s_ub[h_i, :],
+                                        mask_sel,
+                                        acc_s_ub[h_i, :],
+                                        -T.infinity(accum_dtype),
+                                        "VSEL_TENSOR_SCALAR_MODE",
+                                    )
+                                T.copy(m_i, m_i_prev)
+                                T.tile.mul(acc_s_ub, acc_s_ub, softmax_scale)
+                                T.copy(sumexp, sumexp_i_ub)
+                                T.tile.softmax_flashv2(
+                                    acc_s_ub,
+                                    sumexp,
+                                    m_i,
+                                    alpha_exp,
+                                    sumexp_i_ub,
+                                    m_i_prev,
+                                    softmax_tmp,
+                                    v_block,
+                                    BI,
+                                    BI,
+                                )
+                                T.copy(alpha_exp, alpha_cmp_sv[pv1, :])
+                                T.copy(sumexp, sumexp_sv[pv1, :])
+                                T.copy(m_i, m_i_sv[pv1, :])
+                                T.copy(acc_s_ub, acc_s_half)
+                                T.set_flag("v", "mte3", 0)
+                                T.wait_flag("v", "mte3", 0)
+                                T.copy(
+                                    acc_s_half,
+                                    ws_p_cmp[
+                                        cid,
+                                        pv1,
+                                        vid * v_block : vid * v_block + v_block,
+                                        :,
+                                    ],
+                                )
+                            # P_READY only after BOTH ori P (ws_p) and cmp P
+                            # (ws_p_cmp) are written; MTE3-tied so it fences them.
                             T.set_cross_flag("MTE3", _FLAG_P_READY)
 
                         if valid2:
