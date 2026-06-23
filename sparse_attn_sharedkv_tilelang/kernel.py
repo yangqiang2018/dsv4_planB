@@ -675,6 +675,14 @@ def build_sparse_attn_sharedkv(
                             T.set_cross_flag("FIX", _FLAG_PV_READY)
                     T.wait_flag("fix", "m", 0)
                     T.wait_flag("fix", "m", 1)
+                    # Drain the cmp-KV slot flag (M->MTE2 id 6): the loop seeds it
+                    # once and each valid0 iter nets one extra set, leaving one
+                    # un-consumed set per launch. Event IDs are HW state that
+                    # persists across kernel launches, so a leftover set makes the
+                    # next launch's first wait match the stale token -> deadlock in
+                    # a repeated-call (warmup) loop. Consume it here to balance.
+                    for _ in range(1 if NI_cmp > 0 else 0):
+                        T.wait_flag("m", "mte2", 6)
 
                 # =========================== VECTOR ===========================
                 with T.Scope("V"):
