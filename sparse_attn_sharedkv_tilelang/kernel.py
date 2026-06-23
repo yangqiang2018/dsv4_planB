@@ -1043,8 +1043,7 @@ def build_sparse_attn_sharedkv(
                                 ws_o[
                                     cid,
                                     pv2,
-                                    vid * v_block + MERGE_HEADS : vid * v_block
-                                    + 2 * MERGE_HEADS,
+                                    vid * v_block : vid * v_block + MERGE_HEADS,
                                     :,
                                 ],
                                 acc_o_work,
@@ -1065,8 +1064,7 @@ def build_sparse_attn_sharedkv(
                                     ws_o_cmp[
                                         cid,
                                         pv2,
-                                        vid * v_block + MERGE_HEADS : vid * v_block
-                                        + 2 * MERGE_HEADS,
+                                        vid * v_block : vid * v_block + MERGE_HEADS,
                                         :,
                                     ],
                                     acc_o_work2,
@@ -1075,7 +1073,7 @@ def build_sparse_attn_sharedkv(
                                 T.wait_flag("mte2", "v", 6)
                                 T.tile.brcb(
                                     recip_brd8,
-                                    alpha_cmp_rt[MERGE_HEADS : 2 * MERGE_HEADS],
+                                    alpha_cmp_rt[0:MERGE_HEADS],
                                     (MERGE_HEADS + 7) // 8,
                                     1,
                                     8,
@@ -1097,7 +1095,7 @@ def build_sparse_attn_sharedkv(
                                 T.set_flag("v", "mte2", 8)
                             T.tile.brcb(
                                 recip_brd8,
-                                recip[MERGE_HEADS : 2 * MERGE_HEADS],
+                                recip[0:MERGE_HEADS],
                                 (MERGE_HEADS + 7) // 8,
                                 1,
                                 8,
@@ -1107,9 +1105,7 @@ def build_sparse_attn_sharedkv(
                                 acc_o_work, acc_o_work, recip_brd8, MERGE_HEADS, D, D
                             )
                             T.pipe_barrier("v")
-                            T.copy(
-                                acc_o_work, acc_o_half[MERGE_HEADS : 2 * MERGE_HEADS, :]
-                            )
+                            T.copy(acc_o_work, acc_o_half[0:MERGE_HEADS, :])
                             for _ in range(1 if NI_cmp > 0 else 0):
                                 # acc_o_work now free -> pass-2 reuses it as the cmp
                                 # temp (V->MTE2 fence, R2); and wait for pass-1's read
@@ -1120,7 +1116,8 @@ def build_sparse_attn_sharedkv(
                                 ws_o[
                                     cid,
                                     pv2,
-                                    vid * v_block : vid * v_block + MERGE_HEADS,
+                                    vid * v_block + MERGE_HEADS : vid * v_block
+                                    + 2 * MERGE_HEADS,
                                     :,
                                 ],
                                 acc_o_work2,
@@ -1135,7 +1132,8 @@ def build_sparse_attn_sharedkv(
                                     ws_o_cmp[
                                         cid,
                                         pv2,
-                                        vid * v_block : vid * v_block + MERGE_HEADS,
+                                        vid * v_block + MERGE_HEADS : vid * v_block
+                                        + 2 * MERGE_HEADS,
                                         :,
                                     ],
                                     acc_o_work,
@@ -1144,7 +1142,7 @@ def build_sparse_attn_sharedkv(
                                 T.wait_flag("mte2", "v", 7)
                                 T.tile.brcb(
                                     recip_brd8,
-                                    alpha_cmp_rt[0:MERGE_HEADS],
+                                    alpha_cmp_rt[MERGE_HEADS : 2 * MERGE_HEADS],
                                     (MERGE_HEADS + 7) // 8,
                                     1,
                                     8,
@@ -1163,7 +1161,7 @@ def build_sparse_attn_sharedkv(
                                 T.pipe_barrier("v")
                             T.tile.brcb(
                                 recip_brd8,
-                                recip[0:MERGE_HEADS],
+                                recip[MERGE_HEADS : 2 * MERGE_HEADS],
                                 (MERGE_HEADS + 7) // 8,
                                 1,
                                 8,
@@ -1175,7 +1173,7 @@ def build_sparse_attn_sharedkv(
                             T.pipe_barrier("v")
                             T.copy(
                                 acc_o_work2,
-                                acc_o_half[0:MERGE_HEADS, :],
+                                acc_o_half[MERGE_HEADS : 2 * MERGE_HEADS, :],
                             )
                             T.set_flag("v", "mte3", 1)
                             T.wait_flag("v", "mte3", 1)
