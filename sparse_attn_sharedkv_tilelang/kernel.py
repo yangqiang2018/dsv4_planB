@@ -1086,11 +1086,11 @@ def build_sparse_attn_sharedkv(
                                     8,
                                 )
                                 T.pipe_barrier("v")
-                                # TEMP probe3 (revert): OUTPUT acc_o_work2 (= the O_cmp
-                                # pass1 loaded from ws_o_cmp) directly instead of the
-                                # merge, so the token0/head0 value dump shows
-                                # ws_o_cmp/sumexp. 0 => ws_o_cmp==0 (load/visibility);
-                                # -golden => ws_o_cmp==-O_ori; +golden => ==O_ori.
+                                # TEMP probe4 (revert): restore the add, then output
+                                # acc_o_work UNNORMALIZED (recip-normalize below is
+                                # range(0)-skipped). token0 real ~= O_ori (large,
+                                # nonzero) => add fine and recip was zeroing; real == 0
+                                # => the add itself zeroed acc_o_work.
                                 for _ in range(0):
                                     T.tile.row_muls(
                                         acc_o_work,
@@ -1100,22 +1100,29 @@ def build_sparse_attn_sharedkv(
                                         D,
                                         D,
                                     )
-                                T.copy(acc_o_work2, acc_o_work)
+                                T.tile.add(acc_o_work, acc_o_work, acc_o_work2)
                                 T.pipe_barrier("v")
                                 # acc_o_work2 (cmp temp) now free -> pass-2 reloads it
                                 # as O_ori (V->MTE2 fence, R1).
                                 T.set_flag("v", "mte2", 8)
-                            T.tile.brcb(
-                                recip_brd8,
-                                recip[0:MERGE_HEADS],
-                                (MERGE_HEADS + 7) // 8,
-                                1,
-                                8,
-                            )
-                            T.pipe_barrier("v")
-                            T.tile.row_muls(
-                                acc_o_work, acc_o_work, recip_brd8, MERGE_HEADS, D, D
-                            )
+                            # TEMP probe4: recip-normalize SKIPPED (output raw acc_o_work).
+                            for _ in range(0):
+                                T.tile.brcb(
+                                    recip_brd8,
+                                    recip[0:MERGE_HEADS],
+                                    (MERGE_HEADS + 7) // 8,
+                                    1,
+                                    8,
+                                )
+                                T.pipe_barrier("v")
+                                T.tile.row_muls(
+                                    acc_o_work,
+                                    acc_o_work,
+                                    recip_brd8,
+                                    MERGE_HEADS,
+                                    D,
+                                    D,
+                                )
                             T.pipe_barrier("v")
                             T.copy(acc_o_work, acc_o_half[0:MERGE_HEADS, :])
                             for _ in range(1 if NI_cmp > 0 else 0):
